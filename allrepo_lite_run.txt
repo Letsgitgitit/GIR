@@ -1,0 +1,651 @@
+#!/usr/bin/env python3
+# =====================================================================================
+# allrepo_lite_run.py  -  BUILD 2026-11-16d
+# ALLREPO lite gold bake (merge/ALLREPO_LITE_HANDOFF.md). Reads the FULL gold, writes the LITE gold.
+#   gold hist    ALLREPO_gold\FACT_ALLREPO_gold_YYYY.parquet        -> lite hist\FACT_ALLREPO_lite_YYYY.parquet
+#   gold current ALLREPO_gold_v2\current\FACT_ALLREPO_gold_YYYY-MM  -> lite current\FACT_ALLREPO_lite_YYYY-MM.parquet
+# Settings: allrepo_lite_config.py (drop list, rounding, store type, folders). The full gold is opened read-only and
+# never changed. No pandas in the data path (Arrow only): dates and ids pass through untouched.
+#
+# Per gold file: drop DROP_COLUMNS, round ROUND_COLUMNS (half to even, + 0.0), add _SourceFile to hist files (= gold
+# file name, the value the live M adds today), write _staging\<name>.parquet.tmp, VERIFY the tmp file against the gold file
+# (row count, schema, every copied column identical value by value, every rounded column = the rounding of the gold
+# value), then os.replace onto the lite file (retry while Power BI holds it). A file that fails is not published: its
+# previous lite file stays, the run exits 2.
+#
+# Incremental: a lite file is rebuilt only when its gold file changed (size / mtime_ns), the config changed
+# (fingerprint), the lite file is missing or was changed outside the job, or --full. Lite files whose gold file is gone
+# (annual roll) are removed AFTER the new files are written (a refresh in between fails G2 loudly, never misses data).
+#
+# Run (office desktop, Start in = the code folder):
+#   python allrepo_lite_run.py                       daily (after the ALLREPO gold job)
+#   python allrepo_lite_run.py --full                rebuild every file
+#   python allrepo_lite_run.py --only 2025,2026-10   build these periods only (no orphan removal)
+#   L6 type test: --only 2026-10 --round-store int64 --lite-root <scratch folder>
+# Job files live in the lite root beside hist\ and current\ (as ALLREPO_gold_v2): _staging\, _reports\,
+# _lite_manifest.json, _lite_run.lock. The model reads hist\ and current\ only (top level).
+# Exit: 0 PASS · 1 WARN · 2 FAIL
+# =====================================================================================
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+
+import allrepo_lite_config as C
+
+BUILD = "2026-11-16d"
+LOGIC_VERSION = "lite-logic-1"      # bump only when the OUTPUT logic changes (forces a rebuild of every file)
+PINNED = {"python": "3.10", "numpy": "1.21.5", "pandas": "1.3.5", "pyarrow": "24.0.0"}
+HIST_RX = re.compile(r"^%s(\d{4})\.parquet$" % re.escape(C.GOLD_PREFIX), re.I)
+CUR_RX = re.compile(r"^%s(\d{4})-(\d{2})\.parquet$" % re.escape(C.GOLD_PREFIX), re.I)
+LITE_RX = re.compile(r"^%s(\d{4}(?:-\d{2})?)\.parquet$" % re.escape(C.LITE_PREFIX), re.I)
+DATE_COLUMN = "SnapshotDate"
+MANIFEST = "_lite_manifest.json"
+LOCK = "_lite_run.lock"
+STAGING = "_staging"
+REPORTS = "_reports"
+LOCK_STALE_S = 6 * 3600
+REPLACE_TRIES, REPLACE_WAIT_S = 6, 10
+SLICE_ROWS = 262_144
+
+
+# ----------------------------------------------------------------------------------- environment
+def check_versions():
+    import numpy
+    import pandas
+    import pyarrow
+    found = {"python": "%d.%d" % sys.version_info[:2], "numpy": numpy.__version__,
+             "pandas": pandas.__version__, "pyarrow": pyarrow.__version__}
+    return [("%s %s (want %s)" % (k, found[k], v)) for k, v in PINNED.items() if found[k] != v], found
+
+
+def norm(p):
+    return os.path.normcase(os.path.abspath(p))
+
+
+def inside(child, parent):
+    c, p = norm(child), norm(parent)
+    return c == p or c.startswith(p.rstrip("\\/") + os.sep)
+
+
+def config_fingerprint(store):
+    body = json.dumps({"logic": LOGIC_VERSION, "drop": sorted(C.DROP_COLUMNS),
+                       "round": sorted(C.ROUND_COLUMNS.items()), "store": store,
+                       "prefix": C.LITE_PREFIX, "srccol": C.SOURCE_FILE_COLUMN,
+                       "rg": C.ROW_GROUP_ROWS}, sort_keys=True)
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+
+
+# ----------------------------------------------------------------------------------- files
+def list_gold(hist_dir, cur_dir):
+    """[(side, period, gold_path, lite_rel)] top level only (like the M query)."""
+    out = []
+    for d, rx, side in ((hist_dir, HIST_RX, "hist"), (cur_dir, CUR_RX, "current")):
+        for n in sorted(os.listdir(d)):
+            m = rx.match(n)
+            if not m or not os.path.isfile(os.path.join(d, n)):
+                continue
+            period = m.group(1) if side == "hist" else "%s-%s" % (m.group(1), m.group(2))
+            out.append((side, period, os.path.join(d, n), os.path.join(side, C.LITE_PREFIX + period + ".parquet")))
+    return out
+
+
+def stat_of(path):
+    s = os.stat(path)
+    return {"size": s.st_size, "mtime_ns": s.st_mtime_ns}
+
+
+def load_manifest(work):
+    p = os.path.join(work, MANIFEST)
+    if not os.path.exists(p):
+        return {"files": {}}
+    with open(p, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def save_manifest(work, man):
+    p = os.path.join(work, MANIFEST)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(man, fh, indent=1, sort_keys=True)
+    os.replace(tmp, p)
+
+
+def take_lock(work, warns):
+    p = os.path.join(work, LOCK)
+    try:
+        fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        age = time.time() - os.path.getmtime(p)
+        if age < LOCK_STALE_S:
+            return None
+        warns.append("stale lock removed (%.1f h old): a previous run did not finish" % (age / 3600))
+        os.remove(p)
+        fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    os.write(fd, ("%d %s" % (os.getpid(), dt.datetime.now().isoformat())).encode())
+    os.close(fd)
+    return p
+
+
+def replace_with_retry(src, dst, sleep=time.sleep):
+    for i in range(REPLACE_TRIES):
+        try:
+            os.replace(src, dst)
+            return i
+        except PermissionError:
+            if i == REPLACE_TRIES - 1:
+                raise
+            print("   target locked (Power BI open?), retry %d/%d in %d s" % (i + 1, REPLACE_TRIES - 1, REPLACE_WAIT_S))
+            sleep(REPLACE_WAIT_S)
+    return REPLACE_TRIES
+
+
+# ----------------------------------------------------------------------------------- transform
+def round_col(pa, pc, x, nd, store):
+    """Round to nd digits (nd < 0: to 10^-nd), half to even, + 0.0 (no -0.0); cast to int64 if store says so."""
+    x = pc.cast(x, pa.float64())
+    if nd >= 0:
+        r = pc.round(x, ndigits=nd, round_mode="half_to_even")
+    else:
+        f = 10.0 ** (-nd)
+        r = pc.multiply(pc.round(pc.divide(x, f), round_mode="half_to_even"), f)
+    r = pc.add(r, 0.0)
+    if store == "int64":
+        r = pc.cast(r, pa.int64())          # safe cast: fails on any fraction, NaN or overflow instead of truncating
+    return r
+
+
+def out_schema(pa, src_schema, side, store):
+    fields = []
+    for f in src_schema:
+        if f.name in C.DROP_COLUMNS:
+            continue
+        if f.name in C.ROUND_COLUMNS:
+            f = pa.field(f.name, pa.int64() if store == "int64" else pa.float64(), nullable=True)
+        fields.append(f)
+    if side == "hist" and C.SOURCE_FILE_COLUMN not in src_schema.names:
+        fields.append(pa.field(C.SOURCE_FILE_COLUMN, pa.string(), nullable=True))
+    return pa.schema(fields)
+
+
+def transform(pa, pc, t, schema, store, src_name):
+    cols = []
+    for f in schema:
+        if f.name == C.SOURCE_FILE_COLUMN and f.name not in t.column_names:
+            cols.append(pa.array([src_name] * t.num_rows, pa.string()))
+        elif f.name in C.ROUND_COLUMNS:
+            cols.append(round_col(pa, pc, t.column(f.name), C.ROUND_COLUMNS[f.name], store))
+        else:
+            cols.append(t.column(f.name))
+    return pa.table(cols, schema=schema)
+
+
+def slices(pq_file, columns, n=SLICE_ROWS):
+    for b in pq_file.iter_batches(batch_size=n, columns=columns):
+        yield b
+
+
+def aligned(it_a, it_b):
+    """Pairs of equal-length tables from two batch streams whose batch boundaries may differ."""
+    import pyarrow as pa
+    buf_a, buf_b = [], []
+    na = nb = 0
+    ea = eb = False
+    while True:
+        while na < SLICE_ROWS and not ea:
+            try:
+                b = next(it_a)
+                buf_a.append(b)
+                na += b.num_rows
+            except StopIteration:
+                ea = True
+        while nb < na and not eb:
+            try:
+                b = next(it_b)
+                buf_b.append(b)
+                nb += b.num_rows
+            except StopIteration:
+                eb = True
+        k = min(na, nb)
+        if k == 0:
+            yield None if (na or nb) else "end"
+            return
+        ta = pa.Table.from_batches(buf_a).combine_chunks()
+        tb = pa.Table.from_batches(buf_b).combine_chunks()
+        yield ta.slice(0, k), tb.slice(0, k)
+        buf_a = [b for b in ta.slice(k).to_batches()] if ta.num_rows > k else []
+        buf_b = [b for b in tb.slice(k).to_batches()] if tb.num_rows > k else []
+        na, nb = na - k, nb - k
+
+
+def same_values(pa, pc, a, b):
+    """Value-by-value equality, nulls in the same places, NaN equal to NaN."""
+    if a.type != b.type:
+        return False
+    if a.equals(b):
+        return True
+    if not pa.types.is_floating(a.type):
+        return False
+    a, b = a.combine_chunks() if hasattr(a, "combine_chunks") else a, b.combine_chunks() if hasattr(b, "combine_chunks") else b
+    if not pc.all(pc.equal(pc.is_null(a), pc.is_null(b))).as_py():
+        return False
+    na, nb = pc.is_nan(a), pc.is_nan(b)
+    ok = pc.or_kleene(pc.equal(a, b), pc.and_(na, nb))
+    return bool(pc.all(pc.fill_null(ok, True)).as_py())
+
+
+# ----------------------------------------------------------------------------------- one file
+def bake_file(pa, pc, pq, side, period, gold_path, lite_path, store, staging):
+    """Build, verify, publish one lite file. Returns (ok, info, messages)."""
+    t0 = time.time()
+    msgs = []
+    pf = pq.ParquetFile(gold_path)
+    src = pf.schema_arrow
+    name = os.path.basename(gold_path)
+    missing_round = [c for c in C.ROUND_COLUMNS if c not in src.names]
+    if missing_round:
+        return False, None, ["FAIL  %s: rounding column(s) missing: %s" % (name, ", ".join(missing_round))]
+    bad_type = [c for c in C.ROUND_COLUMNS
+                if not (pa.types.is_floating(src.field(c).type) or pa.types.is_integer(src.field(c).type))]
+    if bad_type:
+        return False, None, ["FAIL  %s: rounding column(s) not numeric: %s" % (name, ", ".join(bad_type))]
+    absent_drop = [c for c in C.DROP_COLUMNS if c not in src.names]
+    if absent_drop:
+        msgs.append("INFO  %s: drop column(s) not in this file: %s" % (name, ", ".join(absent_drop)))
+    schema = out_schema(pa, src, side, store)
+    md = pf.metadata
+    codec = md.row_group(0).column(0).compression.lower() if md.num_row_groups else "snappy"
+    codec = "none" if codec == "uncompressed" else codec
+    version = md.format_version if md.format_version in ("1.0", "2.4", "2.6") else "2.6"
+    tmp = os.path.join(staging, side + "_" + os.path.basename(lite_path) + ".tmp")
+    os.makedirs(os.path.dirname(lite_path), exist_ok=True)
+    os.makedirs(staging, exist_ok=True)
+    if os.path.exists(tmp):
+        os.remove(tmp)
+
+    rc = list(C.ROUND_COLUMNS)
+    stats = {c: {"sum_raw": 0.0, "sum_lite": 0.0, "max_row": 0.0, "nulls_raw": 0, "nulls_lite": 0, "nan_raw": 0,
+                 "to_zero": 0, "neg_zero": 0} for c in rc}
+    day_err = {c: {} for c in rc}
+    has_date = DATE_COLUMN in src.names
+    rows = 0
+    # ---- build
+    writer = pq.ParquetWriter(tmp, schema, compression=codec, version=version, use_dictionary=True)
+    try:
+        pend, npend = [], 0
+
+        def flush():
+            if pend:
+                writer.write_table(pa.Table.from_batches(pend, schema=schema), row_group_size=C.ROW_GROUP_ROWS)
+
+        for b in slices(pf, None):
+            t = pa.Table.from_batches([b])
+            lt = transform(pa, pc, t, schema, store, name)
+            rows += t.num_rows
+            for c in rc:
+                raw = pc.cast(t.column(c), pa.float64())
+                lite = pc.cast(lt.column(c), pa.float64())
+                err = pc.subtract(raw, lite)
+                s = stats[c]
+                s["sum_raw"] += pc.sum(raw).as_py() or 0.0
+                s["sum_lite"] += pc.sum(lite).as_py() or 0.0
+                s["max_row"] = max(s["max_row"], pc.max(pc.abs(err)).as_py() or 0.0)
+                s["nulls_raw"] += raw.null_count
+                s["nulls_lite"] += lite.null_count
+                s["nan_raw"] += pc.sum(pc.cast(pc.fill_null(pc.is_nan(raw), False), pa.int64())).as_py() or 0
+                s["to_zero"] += pc.sum(pc.cast(pc.fill_null(pc.and_(pc.not_equal(raw, 0.0), pc.equal(lite, 0.0)),
+                                                            False), pa.int64())).as_py() or 0
+                if store == "double":
+                    nz = pc.and_(pc.equal(lite, 0.0), pc.less(pc.divide(1.0, lite), 0.0))
+                    s["neg_zero"] += pc.sum(pc.cast(pc.fill_null(nz, False), pa.int64())).as_py() or 0
+                if has_date:
+                    g = pa.table({"d": t.column(DATE_COLUMN), "e": err}).group_by("d").aggregate([("e", "sum")])
+                    de = day_err[c]
+                    for d, e in zip(g.column("d").to_pylist(), g.column("e_sum").to_pylist()):
+                        de[d] = de.get(d, 0.0) + (e or 0.0)
+            for rb in lt.to_batches():
+                pend.append(rb)
+                npend += rb.num_rows
+            if npend >= C.ROW_GROUP_ROWS:
+                big = pa.Table.from_batches(pend, schema=schema)
+                writer.write_table(big.slice(0, C.ROW_GROUP_ROWS), row_group_size=C.ROW_GROUP_ROWS)
+                rest = big.slice(C.ROW_GROUP_ROWS)
+                pend, npend = rest.to_batches(), rest.num_rows
+        flush()
+    finally:
+        writer.close()
+    t_build = time.time() - t0
+
+    # ---- verify the tmp file against the gold file
+    problems = []
+    lf = pq.ParquetFile(tmp)
+    if lf.metadata.num_rows != md.num_rows or rows != md.num_rows:
+        problems.append("rows gold %d, read %d, lite %d" % (md.num_rows, rows, lf.metadata.num_rows))
+    if not lf.schema_arrow.equals(schema, check_metadata=False):
+        problems.append("lite schema differs from the expected schema")
+    for c in rc:
+        if stats[c]["nulls_raw"] != stats[c]["nulls_lite"]:
+            problems.append("%s nulls %d -> %d" % (c, stats[c]["nulls_raw"], stats[c]["nulls_lite"]))
+        if stats[c]["neg_zero"]:
+            problems.append("%s has %d -0.0 values" % (c, stats[c]["neg_zero"]))
+        half = 0.5 * 10.0 ** (-C.ROUND_COLUMNS[c])
+        if stats[c]["max_row"] > half * (1 + 1e-9):       # arithmetic invariant of rounding, not a tolerance
+            problems.append("%s row error %.6f above half a rounding step %.6f" % (c, stats[c]["max_row"], half))
+    if not problems:
+        mism = {}
+        pair_iter = aligned(slices(pf, None), slices(lf, None))
+        for pair in pair_iter:
+            if pair == "end":
+                break
+            if pair is None:
+                problems.append("row streams of gold and lite end at different rows")
+                break
+            g, l_ = pair
+            for f in schema:
+                if f.name == C.SOURCE_FILE_COLUMN and f.name not in g.column_names:
+                    col = l_.column(f.name)
+                    ok = col.null_count == 0 and pc.all(pc.equal(col, name)).as_py()
+                elif f.name in C.ROUND_COLUMNS:
+                    ok = same_values(pa, pc, round_col(pa, pc, g.column(f.name), C.ROUND_COLUMNS[f.name], store),
+                                     l_.column(f.name))
+                else:
+                    ok = same_values(pa, pc, g.column(f.name), l_.column(f.name))
+                if not ok:
+                    mism[f.name] = mism.get(f.name, 0) + 1
+        if mism:
+            problems.append("values differ from the gold in: " + ", ".join(sorted(mism)))
+    t_verify = time.time() - t0 - t_build
+    for h in (lf, pf):                               # release the handles before the replace (Windows)
+        if hasattr(h, "close"):
+            h.close()
+    del lf
+    if problems:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False, None, msgs + ["FAIL  %s: not published (previous lite file kept): %s" % (name, "; ".join(problems))]
+
+    # ---- publish
+    retries = replace_with_retry(tmp, lite_path)
+    if retries:
+        msgs.append("INFO  %s published after %d retry(ies) on a locked target" % (os.path.basename(lite_path), retries))
+    info = {"rows": rows, "secs_build": round(t_build, 1), "secs_verify": round(t_verify, 1),
+            "stats": stats,
+            "max_day": {c: max([abs(v) for v in day_err[c].values()] or [0.0]) for c in rc},
+            "days": len(day_err[rc[0]]) if rc else 0,
+            "gold_mb": os.path.getsize(gold_path) / 1e6, "lite_mb": os.path.getsize(lite_path) / 1e6}
+    return True, info, msgs
+
+
+# ----------------------------------------------------------------------------------- main
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="ALLREPO lite gold bake")
+    ap.add_argument("--full", action="store_true", help="rebuild every lite file")
+    ap.add_argument("--only", default="", help="periods to build, e.g. 2025,2026-10 (2026 = every 2026 month)")
+    ap.add_argument("--hist-dir", default=C.HIST_GOLD_DIR)
+    ap.add_argument("--current-dir", default=C.CUR_GOLD_DIR)
+    ap.add_argument("--lite-root", default=C.LITE_ROOT)
+    ap.add_argument("--round-store", choices=["double", "int64"], default=None,
+                    help="override ROUND_STORE (L6 type test; only with a --lite-root other than the config one)")
+    a = ap.parse_args(argv)
+
+    t0 = time.time()
+    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    fails, warns, infos = [], [], []
+    bad, found = check_versions()
+    print("allrepo_lite_run BUILD %s" % BUILD)
+    if bad:
+        print("FAIL  environment mismatch: %s" % "; ".join(bad))
+        return 2
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    store = a.round_store or C.ROUND_STORE
+    a.work_dir = a.lite_root
+    a.report_ok = False                              # no report into the lite root before its folder guards pass
+    # ---- configuration and folder guards (before anything is written)
+    if a.round_store and norm(a.lite_root) == norm(C.LITE_ROOT):
+        fails.append("--round-store is for the L6 test only: give a scratch --lite-root as well")
+    if store not in ("double", "int64"):
+        fails.append("ROUND_STORE must be double or int64, not %r" % store)
+    if store == "int64" and any(nd > 0 for nd in C.ROUND_COLUMNS.values()):
+        fails.append("int64 store needs every ROUND_COLUMNS digit <= 0")
+    both = set(C.DROP_COLUMNS) & set(C.ROUND_COLUMNS)
+    if both:
+        fails.append("column(s) both dropped and rounded: %s" % ", ".join(sorted(both)))
+    for d, what in ((a.hist_dir, "hist gold"), (a.current_dir, "current gold")):
+        if not os.path.isdir(d):
+            fails.append("%s folder not found: %s" % (what, d))
+        elif inside(a.lite_root, d) or inside(d, a.lite_root):
+            fails.append("lite root %s and %s folder %s overlap (Folder.Files is recursive)" % (a.lite_root, what, d))
+    if fails:
+        return finish(a, stamp, t0, found, store, None, [], [], {}, fails, warns, infos)
+    a.report_ok = True
+    os.makedirs(a.lite_root, exist_ok=True)
+    lock = take_lock(a.work_dir, warns)
+    if lock is None:
+        print("FAIL  another lite run holds %s" % os.path.join(a.work_dir, LOCK))
+        return 2
+    try:
+        return run(a, stamp, t0, found, store, pa, pc, pq, fails, warns, infos)
+    finally:
+        try:
+            os.remove(lock)
+        except OSError:
+            pass
+
+
+def run(a, stamp, t0, found, store, pa, pc, pq, fails, warns, infos):
+    fp = config_fingerprint(store)
+    gold = list_gold(a.hist_dir, a.current_dir)
+    hist_years = [p for s, p, _, _ in gold if s == "hist"]
+    cur_years = sorted({p[:4] for s, p, _, _ in gold if s == "current"})
+    if not hist_years:
+        fails.append("no %s*.parquet in hist gold %s" % (C.GOLD_PREFIX, a.hist_dir))
+    if not cur_years:
+        fails.append("no %s*.parquet in current gold %s" % (C.GOLD_PREFIX, a.current_dir))
+    overlap = sorted(set(hist_years) & set(cur_years))
+    if overlap:
+        fails.append("year(s) in both hist and current gold (annual roll half done?): %s" % ", ".join(overlap))
+    if not fails:
+        first_cur = [g for g in gold if g[0] == "current"][0][2]
+        ref = pq.ParquetFile(first_cur).schema_arrow
+        typo = [c for c in list(C.DROP_COLUMNS) + list(C.ROUND_COLUMNS) if c not in ref.names]
+        if typo:
+            fails.append("config names column(s) not in the gold (%s): %s" % (os.path.basename(first_cur), ", ".join(typo)))
+    if fails:
+        return finish(a, stamp, t0, found, store, fp, gold, [], {}, fails, warns, infos)
+
+    only = [x.strip() for x in a.only.split(",") if x.strip()]
+    selected = gold
+    if only:
+        selected = [g for g in gold if any(g[1] == o or (len(o) == 4 and g[1][:4] == o) for o in only)]
+        unknown = [o for o in only if not any(g[1] == o or (len(o) == 4 and g[1][:4] == o) for g in gold)]
+        if unknown:
+            fails.append("--only period(s) with no gold file: %s" % ", ".join(unknown))
+            return finish(a, stamp, t0, found, store, fp, gold, [], {}, fails, warns, infos)
+
+    staging = os.path.join(a.lite_root, STAGING)
+    if os.path.isdir(staging):
+        for n in sorted(os.listdir(staging)):
+            if n.endswith(".parquet.tmp"):
+                os.remove(os.path.join(staging, n))
+                infos.append("stray staging file from an earlier run removed: %s" % n)
+    man = load_manifest(a.work_dir)
+    if man.get("lite_root") and norm(man["lite_root"]) != norm(a.lite_root):
+        warns.append("manifest was written for lite root %s: starting a new manifest for %s"
+                     % (man["lite_root"], a.lite_root))
+        man = {"files": {}}
+    man["lite_root"] = a.lite_root
+    files = man.setdefault("files", {})
+
+    # ---- decide
+    todo = []
+    for side, period, gp, rel in selected:
+        lp = os.path.join(a.lite_root, rel)
+        gs = stat_of(gp)
+        e = files.get(rel)
+        reason = None
+        if a.full:
+            reason = "--full"
+        elif e is None:
+            reason = "new"
+        elif e.get("fingerprint") != fp:
+            reason = "config changed"
+        elif e.get("gold_name") != os.path.basename(gp) or e.get("gold_size") != gs["size"] \
+                or e.get("gold_mtime_ns") != gs["mtime_ns"]:
+            reason = "gold changed"
+        elif not os.path.exists(lp):
+            reason = "lite file missing"
+        else:
+            ls = stat_of(lp)
+            if ls["size"] != e.get("lite_size") or ls["mtime_ns"] != e.get("lite_mtime_ns"):
+                reason = "lite file changed outside the job"
+        if reason:
+            todo.append((side, period, gp, rel, lp, gs, reason))
+    print("gold: %d hist file(s) · %d current file(s) · selected %d · to build %d · store %s · config %s"
+          % (len(hist_years), sum(1 for g in gold if g[0] == "current"), len(selected), len(todo), store, fp))
+
+    # ---- build
+    built = {}
+    for i, (side, period, gp, rel, lp, gs, reason) in enumerate(todo, 1):
+        print("%d/%d  %-10s %-8s (%s) ..." % (i, len(todo), side, period, reason))
+        try:
+            ok, info, msgs = bake_file(pa, pc, pq, side, period, gp, lp, store, staging)
+        except Exception as ex:                      # one bad file must not stop the others; loud, never silent
+            ok, info, msgs = False, None, ["FAIL  %s: %s: %s" % (os.path.basename(gp), type(ex).__name__, ex)]
+            tmp = os.path.join(staging, side + "_" + os.path.basename(lp) + ".tmp")
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        for m in msgs:
+            (fails if m.startswith("FAIL") else infos).append(m[6:])
+        if not ok:
+            print("      FAILED - see report")
+            continue
+        ls = stat_of(lp)
+        files[rel] = {"gold_name": os.path.basename(gp), "gold_size": gs["size"], "gold_mtime_ns": gs["mtime_ns"],
+                      "lite_size": ls["size"], "lite_mtime_ns": ls["mtime_ns"], "rows": info["rows"],
+                      "fingerprint": fp, "build": BUILD, "built_at": dt.datetime.now().isoformat(timespec="seconds")}
+        save_manifest(a.work_dir, man)               # commit after every file
+        if stat_of(gp) != gs:
+            warns.append("%s changed during the build: rebuilt again on the next run" % os.path.basename(gp))
+            files[rel]["gold_mtime_ns"] = -1
+            save_manifest(a.work_dir, man)
+        info["reason"] = reason
+        built[rel] = info
+        print("      %s rows · build %.1f s · verify %.1f s · %.1f MB -> %.1f MB"
+              % (format(info["rows"], ","), info["secs_build"], info["secs_verify"], info["gold_mb"], info["lite_mb"]))
+
+    # ---- orphans and stray tmp files (full scope only, after the builds)
+    removed = []
+    for side in ("hist", "current"):
+        d = os.path.join(a.lite_root, side)
+        if not os.path.isdir(d):
+            continue
+        for n in sorted(os.listdir(d)):
+            rel = os.path.join(side, n)
+            if n.endswith(".parquet.tmp"):
+                os.remove(os.path.join(d, n))
+                removed.append(rel + " (stray tmp)")
+            elif not only and LITE_RX.match(n) and rel not in {g[3] for g in gold}:
+                if fails:
+                    warns.append("orphan %s kept: the run has a FAIL" % rel)
+                    continue
+                os.remove(os.path.join(d, n))
+                files.pop(rel, None)
+                removed.append(rel + " (gold file gone)")
+            elif not LITE_RX.match(n):
+                infos.append("not a lite file, left alone: %s" % rel)
+    if not only:
+        for rel in [r for r in files if r not in {g[3] for g in gold}]:
+            files.pop(rel, None)
+    man["fingerprint"] = fp
+    save_manifest(a.work_dir, man)
+    return finish(a, stamp, t0, found, store, fp, gold, removed, built, fails, warns, infos)
+
+
+# ----------------------------------------------------------------------------------- report
+def finish(a, stamp, t0, found, store, fp, gold, removed, built, fails, warns, infos):
+    status = "FAIL" if fails else ("WARN" if warns else "PASS")
+    L = ["ALLREPO LITE BAKE  BUILD %s  run %s  (%.0f s)  STATUS %s" % (BUILD, stamp, time.time() - t0, status),
+         "env: python %s · numpy %s · pandas %s · pyarrow %s" % (found["python"], found["numpy"], found["pandas"],
+                                                                 found["pyarrow"]),
+         "config: drop {%s} · round {%s} · store %s · fingerprint %s · %s" % (
+             ", ".join(C.DROP_COLUMNS), ", ".join("%s %d" % kv for kv in C.ROUND_COLUMNS.items()), store, fp, LOGIC_VERSION),
+         "folders: gold hist %s · gold current %s · lite %s" % (a.hist_dir, a.current_dir, a.lite_root),
+         "Files: gold %d · built %d · removed %d%s" % (len(gold), len(built), len(removed),
+                                                      (" · --only " + a.only) if a.only else (" · --full" if a.full else ""))]
+    for rel, inf in built.items():
+        L.append("Built: %-36s %-24s %12s rows · %5d dates · %8.1f MB -> %8.1f MB · build %.0f s · verify %.0f s · verified"
+                 % (rel, "(" + inf["reason"] + ")", format(inf["rows"], ","), inf["days"], inf["gold_mb"], inf["lite_mb"],
+                    inf["secs_build"], inf["secs_verify"]))
+    for r in removed:
+        L.append("Removed: " + r)
+    if built:
+        L.append("Rounding (built files): column · file · sum gold EUR · sum lite EUR · diff EUR · max row EUR · "
+                 "max day diff EUR · rows to 0 · nulls")
+        for c in C.ROUND_COLUMNS:
+            for rel, inf in built.items():
+                s = inf["stats"][c]
+                L.append("  %-18s %-36s %22s %22s %16s %8s %14s %10s %10s" % (
+                    c, rel, num(s["sum_raw"]), num(s["sum_lite"]), num(s["sum_raw"] - s["sum_lite"]), num(s["max_row"]),
+                    num(inf["max_day"][c]), format(s["to_zero"], ","), format(s["nulls_raw"], ",")))
+    lite_mb = gold_mb = 0.0
+    periods = {"hist": [], "current": []}
+    for side, period, gp, rel in gold:
+        gold_mb += os.path.getsize(gp) / 1e6
+        lp = os.path.join(a.lite_root, rel)
+        if os.path.exists(lp):
+            lite_mb += os.path.getsize(lp) / 1e6
+            periods[side].append(period)
+    L.append("Lite folder: hist %s · current %s · %.1f MB on disk (gold %.1f MB)" % (
+        ",".join(periods["hist"]) or "-", (periods["current"][0] + ".." + periods["current"][-1]) if periods["current"]
+        else "-", lite_mb, gold_mb))
+    missing = [rel for _, _, _, rel in gold if not os.path.exists(os.path.join(a.lite_root, rel))]
+    if missing and not a.only:
+        fails.append("lite file(s) missing after the run: " + ", ".join(missing))
+        status = "FAIL"
+        L[0] = L[0].rsplit("STATUS", 1)[0] + "STATUS FAIL"
+    for i in infos:
+        L.append("INFO  " + i)
+    for w in warns:
+        L.append("WARN  " + w)
+    for f in fails:
+        L.append("FAIL  " + f)
+    L.append("STATUS %s · built %d · removed %d · %d FAIL · %d WARN" % (status, len(built), len(removed),
+                                                                     len(fails), len(warns)))
+    text = "\n".join(L) + "\n"
+    print(text)
+    if not getattr(a, "report_ok", False):
+        print("report not written: the lite root did not pass the folder guards")
+        return {"PASS": 0, "WARN": 1, "FAIL": 2}[status]
+    try:
+        rep = os.path.join(a.work_dir, REPORTS)
+        os.makedirs(rep, exist_ok=True)
+        p = os.path.join(rep, "allrepo_lite_%s.txt" % stamp)
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        with open(os.path.join(rep, "allrepo_lite_last.txt"), "w", encoding="utf-8") as fh:
+            fh.write(text)
+        print("report: " + p)
+    except OSError as ex:
+        print("FAIL  report not written: %s" % ex)
+        return 2
+    return {"PASS": 0, "WARN": 1, "FAIL": 2}[status]
+
+
+def num(v):
+    return format(int(round(v)), ",") if abs(v) >= 1 else ("%.4f" % v)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

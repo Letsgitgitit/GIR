@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+# =====================================================================================
+# allrepo_lite_selftest.py  -  BUILD 2026-11-16d
+# Selftest for allrepo_lite_run.py. Builds a small synthetic full gold in a temp folder (never touches G: or H:),
+# runs the bake on it and asserts on the output AND on what each run touches (file mtime_ns, files built / removed).
+# Run in the code folder, pinned environment:  python allrepo_lite_selftest.py      -> "SELFTEST n/n PASS", exit 0
+# =====================================================================================
+import contextlib
+import datetime as dt
+import io
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
+
+import allrepo_lite_config as C
+import allrepo_lite_run as R
+
+BUILD = "2026-11-16d"
+RESULTS = []
+ROUND = ["RiskNet_EUR", "RiskBrut_EUR", "CashAmount_EUR", "NotionalBond_EUR", "MTMSecurity_EUR", "MTMCash_EUR"]
+ORIG = {"DROP": list(C.DROP_COLUMNS), "ROUND": dict(C.ROUND_COLUMNS), "STORE": C.ROUND_STORE,
+        "RG": C.ROW_GROUP_ROWS, "SLICE": R.SLICE_ROWS, "WAIT": R.REPLACE_WAIT_S}
+
+
+def check(name, cond, detail=""):
+    RESULTS.append((name, bool(cond), detail))
+
+
+def reset_config():
+    C.DROP_COLUMNS[:] = ORIG["DROP"]
+    C.ROUND_COLUMNS.clear()
+    C.ROUND_COLUMNS.update(ORIG["ROUND"])
+    C.ROUND_STORE = ORIG["STORE"]
+    C.ROW_GROUP_ROWS = ORIG["RG"]
+    R.SLICE_ROWS = ORIG["SLICE"]
+    R.REPLACE_WAIT_S = ORIG["WAIT"]
+
+
+# ----------------------------------------------------------------------------------- synthetic gold
+SPECIAL = [1499.999, 1500.0, 2500.0, -400.0, -500.0, 499.9, None, 123456789.4, -2500.0, 0.0]
+
+
+def gold_table(year, month, n, with_source, seed=0, bump=0.0):
+    days = [dt.date(year, month, 1 + (i % 20)) for i in range(n)]
+    vals = [SPECIAL[i % len(SPECIAL)] if i < 40 else ((i * 7919 + seed) % 10_000_000) / 7.0 - 300_000 for i in range(n)]
+    vals = [v + bump if v is not None else None for v in vals]
+    cols = {
+        "SnapshotDate": pa.array(days, pa.date32()),
+        "HeadOfficeSirisId": pa.array(["%010d" % (i % 13) for i in range(n)]),
+        "AmountBuy": pa.array([float(i) for i in range(n)]),
+        "AmountSell": pa.array([float(-i) for i in range(n)]),
+        "AmountBuy_EUR": pa.array([i * 1.123456789 for i in range(n)]),
+        "Haircut": pa.array([float("nan") if i % 17 == 0 else (None if i % 19 == 0 else (i % 100) / 1000.0)
+                             for i in range(n)], pa.float64()),
+        "MaturityDate": pa.array([dt.date(2073, 1, 1) if i % 11 == 0 else (None if i % 23 == 0 else dt.date(2027, 5, 3))
+                                  for i in range(n)], pa.date32()),
+        "CCCTradeKey": pa.array([None if i % 29 == 0 else ("" if i % 31 == 0 else "k%d" % i) for i in range(n)]),
+        "IssuerId": pa.array(["000000000#" if i % 5 == 0 else "%010d" % i for i in range(n)]),
+        "Trades": pa.array(list(range(n)), pa.int64()),
+        "FO_ID": pa.array(["fo%d" % i for i in range(n)]),
+        "MarkToMark_EUR": pa.array([float(i) * 3.3 for i in range(n)]),
+        "MTMCash": pa.array([float(i) * 1.7 for i in range(n)]),
+        "MTMSecurity": pa.array([float(i) * 1.9 for i in range(n)]),
+        "SumAmountBuySell_EUR": pa.array([float(i) * 2.1 for i in range(n)]),
+        "TransactionId": pa.array(["t%d" % i for i in range(n)]),
+    }
+    for j, c in enumerate(ROUND):
+        cols[c] = pa.array([None if v is None else v * (1 + j) for v in vals], pa.float64())
+    if with_source:
+        cols["_SourceFile"] = pa.array(["Extraction_AllRepo_PROD_Q%04d%02d%02d.csv" % (year, month, 1 + (i % 20))
+                                        for i in range(n)])
+    return pa.table(cols)
+
+
+def write_gold(path, t, rg=None):
+    pq.write_table(t, path, row_group_size=rg or max(t.num_rows, 1), compression="snappy")
+
+
+def make_gold(root):
+    h = os.path.join(root, "gold", "ALLREPO_gold")
+    c = os.path.join(root, "gold", "ALLREPO_gold_v2", "current")
+    os.makedirs(h)
+    os.makedirs(c)
+    write_gold(os.path.join(h, "FACT_ALLREPO_gold_2024.parquet"), gold_table(2024, 3, 700, False, 1), rg=300)
+    write_gold(os.path.join(h, "FACT_ALLREPO_gold_2025.parquet"), gold_table(2025, 6, 650, False, 2))
+    write_gold(os.path.join(c, "FACT_ALLREPO_gold_2026-09.parquet"), gold_table(2026, 9, 400, True, 3))
+    write_gold(os.path.join(c, "FACT_ALLREPO_gold_2026-10.parquet"), gold_table(2026, 10, 450, True, 4))
+    with open(os.path.join(h, "notes.txt"), "w") as fh:
+        fh.write("not a gold file")
+    return h, c
+
+
+def run(h, c, lite, work, *extra):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = R.main(["--hist-dir", h, "--current-dir", c, "--lite-root", lite] + list(extra))   # job files in lite
+    return code, buf.getvalue()
+
+
+def lite_files(lite):
+    out = {}
+    for side in ("hist", "current"):
+        d = os.path.join(lite, side)
+        if os.path.isdir(d):
+            for n in os.listdir(d):
+                out[os.path.join(side, n)] = os.stat(os.path.join(d, n)).st_mtime_ns
+    return out
+
+
+def built_lines(text):
+    return [l for l in text.splitlines() if l.startswith("Built: ")]
+
+
+def expected_round(v, nd=-3):
+    if v is None:
+        return None
+    f = 10.0 ** (-nd)
+    q = v / f
+    r = round(q)                     # Python round = half to even
+    return float(r * f) + 0.0
+
+
+# ----------------------------------------------------------------------------------- tests
+def tests(root):
+    h, c = make_gold(root)
+    lite = os.path.join(root, "out", "ALLREPO_lite")
+    work = lite                       # manifest, lock, _staging, _reports live in the lite root
+    C.ROW_GROUP_ROWS = 256            # several row groups per lite file
+    R.SLICE_ROWS = 100                # slices that cross gold row groups
+
+    # T1 first run
+    code, out = run(h, c, lite, work)
+    f1 = lite_files(lite)
+    check("T1 first run exit 0", code == 0, out[-400:])
+    check("T1 four lite files with lite names",
+          sorted(f1) == sorted([os.path.join("hist", "FACT_ALLREPO_lite_2024.parquet"),
+                                os.path.join("hist", "FACT_ALLREPO_lite_2025.parquet"),
+                                os.path.join("current", "FACT_ALLREPO_lite_2026-09.parquet"),
+                                os.path.join("current", "FACT_ALLREPO_lite_2026-10.parquet")]), sorted(f1))
+    check("T1 four files built", len(built_lines(out)) == 4)
+    check("T1 no .tmp left", not any(k.endswith(".tmp") for k in f1))
+
+    g = pq.read_table(os.path.join(h, "FACT_ALLREPO_gold_2024.parquet"))
+    l = pq.read_table(os.path.join(lite, "hist", "FACT_ALLREPO_lite_2024.parquet"))
+    # T2 columns
+    DROPPED = ("AmountBuy", "AmountSell", "FO_ID", "MarkToMark_EUR", "MTMCash", "MTMSecurity", "SumAmountBuySell_EUR",
+               "TransactionId")
+    check("T2 the eight dropped columns absent", not any(x in l.column_names for x in DROPPED))
+    check("T2 AmountBuy_EUR kept", "AmountBuy_EUR" in l.column_names)
+    check("T2 column order = gold order minus drops, _SourceFile last",
+          l.column_names == [x for x in g.column_names if x not in DROPPED] + ["_SourceFile"],
+          l.column_names)
+    same = all(l.column(x).equals(g.column(x)) or (x == "Haircut" and R.same_values(pa, pc, l.column(x), g.column(x)))
+               for x in g.column_names if x not in ROUND and x not in DROPPED)
+    check("T2 every copied column identical (incl. NaN, nulls, '', 2073 dates, '#' ids)", same)
+    check("T2 copied types unchanged", all(l.schema.field(x).type == g.schema.field(x).type
+                                           for x in g.column_names if x in l.column_names and x not in ROUND))
+    check("T2 several row groups", pq.ParquetFile(os.path.join(lite, "hist", "FACT_ALLREPO_lite_2024.parquet"))
+          .metadata.num_row_groups >= 3)
+    # T3 rounding
+    exp = [expected_round(v) for v in g.column("RiskNet_EUR").to_pylist()]
+    got = l.column("RiskNet_EUR").to_pylist()
+    check("T3 RiskNet_EUR = half-to-even EUR 1k of gold", exp == got, str([(a, b) for a, b in zip(exp, got) if a != b][:5]))
+    check("T3 1500 -> 2000, 2500 -> 2000, -2500 -> -2000, 1499.999 -> 1000",
+          got[1] == 2000.0 and got[2] == 2000.0 and got[8] == -2000.0 and got[0] == 1000.0, got[:10])
+    negz = [v for v in got if v == 0.0 and str(v).startswith("-")]
+    check("T3 no -0.0 (-400 and -500 give 0.0)", not negz and got[3] == 0.0 and got[4] == 0.0)
+    check("T3 null stays null", got[6] is None)
+    check("T3 rounded columns double", all(l.schema.field(x).type == pa.float64() for x in ROUND))
+    check("T3 all six columns rounded", all(all(v is None or v % 1000 == 0 for v in l.column(x).to_pylist())
+                                            for x in ROUND))
+    # T4 _SourceFile
+    check("T4 hist _SourceFile = gold yearly file name",
+          set(l.column("_SourceFile").to_pylist()) == {"FACT_ALLREPO_gold_2024.parquet"})
+    gc = pq.read_table(os.path.join(c, "FACT_ALLREPO_gold_2026-10.parquet"))
+    lc = pq.read_table(os.path.join(lite, "current", "FACT_ALLREPO_lite_2026-10.parquet"))
+    check("T4 current _SourceFile copied from gold", lc.column("_SourceFile").equals(gc.column("_SourceFile")))
+    check("T4 hist and current lite files have the same column set",
+          sorted(lc.column_names) == sorted(l.column_names))
+    check("T4 hist and current lite files have the same types",
+          all(lc.schema.field(x).type == l.schema.field(x).type for x in l.column_names))
+
+    # T5 second run touches nothing
+    time.sleep(0.02)
+    code, out = run(h, c, lite, work)
+    check("T5 second run exit 0, nothing built", code == 0 and not built_lines(out), out[-300:])
+    check("T5 no lite file touched (mtime_ns)", lite_files(lite) == f1)
+
+    # T6 one gold month changes -> only that month rebuilt
+    write_gold(os.path.join(c, "FACT_ALLREPO_gold_2026-10.parquet"), gold_table(2026, 10, 470, True, 4, bump=1.0))
+    code, out = run(h, c, lite, work)
+    f2 = lite_files(lite)
+    changed = sorted(k for k in f2 if f2[k] != f1.get(k))
+    check("T6 only 2026-10 rebuilt", changed == [os.path.join("current", "FACT_ALLREPO_lite_2026-10.parquet")], changed)
+    check("T6 reason gold changed", any("(gold changed)" in x for x in built_lines(out)))
+    check("T6 new rows in lite", pq.ParquetFile(os.path.join(lite, "current", "FACT_ALLREPO_lite_2026-10.parquet"))
+          .metadata.num_rows == 470)
+
+    # T6b gold file rewritten with the same size (same data, new mtime) -> rebuilt
+    p10 = os.path.join(c, "FACT_ALLREPO_gold_2026-10.parquet")
+    size10 = os.path.getsize(p10)
+    write_gold(p10, pq.read_table(p10))
+    os.utime(p10, ns=(time.time_ns(), time.time_ns() + 5_000_000_000))
+    f2b = lite_files(lite)
+    code, out = run(h, c, lite, work)
+    check("T6b same-size gold rewrite rebuilt (mtime_ns key)", os.path.getsize(p10) == size10
+          and [x for x in built_lines(out)] and "2026-10" in built_lines(out)[0] and len(built_lines(out)) == 1)
+    f1 = lite_files(lite)
+
+    # T13 lite file edited outside the job -> rebuilt
+    p = os.path.join(lite, "current", "FACT_ALLREPO_lite_2026-09.parquet")
+    pq.write_table(pq.read_table(p).slice(0, 10), p)
+    code, out = run(h, c, lite, work)
+    check("T13 lite file changed outside -> rebuilt", any("lite file changed outside" in x for x in built_lines(out))
+          and pq.ParquetFile(p).metadata.num_rows == 400)
+    os.remove(p)
+    code, out = run(h, c, lite, work)
+    check("T13 lite file missing -> rebuilt", any("lite file missing" in x for x in built_lines(out)) and os.path.exists(p))
+
+    # T7 config change -> every file rebuilt, re-included rounding = gold value again
+    f3 = lite_files(lite)
+    del C.ROUND_COLUMNS["MTMCash_EUR"]
+    code, out = run(h, c, lite, work)
+    f4 = lite_files(lite)
+    check("T7 config change rebuilds all 4", code == 0 and len(built_lines(out)) == 4
+          and all(f4[k] != f3[k] for k in f3), out[-300:])
+    check("T7 reason config changed", all("(config changed)" in x for x in built_lines(out)))
+    l = pq.read_table(os.path.join(lite, "hist", "FACT_ALLREPO_lite_2024.parquet"))
+    check("T7 MTMCash_EUR back to full precision", l.column("MTMCash_EUR").equals(g.column("MTMCash_EUR")))
+    C.DROP_COLUMNS.remove("AmountSell")
+    code, out = run(h, c, lite, work)
+    l = pq.read_table(os.path.join(lite, "hist", "FACT_ALLREPO_lite_2024.parquet"))
+    check("T7 re-included AmountSell present and identical", "AmountSell" in l.column_names
+          and l.column("AmountSell").equals(g.column("AmountSell")))
+    reset_config()
+    C.ROW_GROUP_ROWS, R.SLICE_ROWS = 256, 100
+    code, out = run(h, c, lite, work)
+    check("T7 back to v1 config rebuilds all 4", len(built_lines(out)) == 4)
+
+    # T8 int64 store (L6 test) into a scratch root
+    scratch = os.path.join(root, "out", "L6_int64")
+    code, out = run(h, c, scratch, os.path.join(root, "work_l6"), "--only", "2026-10", "--round-store", "int64")
+    li = pq.read_table(os.path.join(scratch, "current", "FACT_ALLREPO_lite_2026-10.parquet"))
+    ld = pq.read_table(os.path.join(lite, "current", "FACT_ALLREPO_lite_2026-10.parquet"))
+    check("T8 int64 run exit 0, one file", code == 0 and list(lite_files(scratch)) ==
+          [os.path.join("current", "FACT_ALLREPO_lite_2026-10.parquet")], out[-300:])
+    check("T8 rounded columns int64", all(li.schema.field(x).type == pa.int64() for x in ROUND))
+    check("T8 int64 values = double values", all(
+        [None if v is None else float(v) for v in li.column(x).to_pylist()] == ld.column(x).to_pylist() for x in ROUND))
+    C.ROUND_STORE = "int64"
+    check("T8 fingerprint differs by store", R.config_fingerprint("int64") != R.config_fingerprint("double"))
+    reset_config()
+    C.ROW_GROUP_ROWS, R.SLICE_ROWS = 256, 100
+    old = C.LITE_ROOT
+    C.LITE_ROOT = lite
+    before = lite_files(lite)
+    code, out = run(h, c, lite, work, "--round-store", "int64")
+    C.LITE_ROOT = old
+    check("T8 --round-store on the production lite root refused", code == 2 and lite_files(lite) == before)
+
+    # T16 --only
+    before = lite_files(lite)
+    code, out = run(h, c, lite, work, "--only", "2025", "--full")
+    after = lite_files(lite)
+    check("T16 --only 2025 --full rebuilds that year only",
+          sorted(k for k in after if after[k] != before[k]) == [os.path.join("hist", "FACT_ALLREPO_lite_2025.parquet")])
+    code, out = run(h, c, lite, work, "--only", "2019")
+    check("T16 --only with an unknown period FAILS", code == 2)
+
+    # T10 typo in config -> FAIL, nothing written
+    before = lite_files(lite)
+    C.DROP_COLUMNS.append("AmountBuyy")
+    code, out = run(h, c, lite, work, "--full")
+    reset_config()
+    C.ROW_GROUP_ROWS, R.SLICE_ROWS = 256, 100
+    check("T10 unknown config column FAILS before writing", code == 2 and lite_files(lite) == before
+          and "AmountBuyy" in out)
+
+    # T11 lite root inside a gold folder -> FAIL
+    code, out = run(h, c, os.path.join(h, "ALLREPO_lite"), os.path.join(root, "w11"))
+    check("T11 lite root inside the gold folder refused, nothing written there",
+          code == 2 and not os.path.exists(os.path.join(h, "ALLREPO_lite")) and sorted(os.listdir(h)) ==
+          ["FACT_ALLREPO_gold_2024.parquet", "FACT_ALLREPO_gold_2025.parquet", "notes.txt"])
+
+    # T14 locked target -> retried, published
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def flaky(src, dst):
+        if src.endswith(".parquet.tmp") and calls["n"] < 2:
+            calls["n"] += 1
+            raise PermissionError("locked")
+        return real_replace(src, dst)
+    R.REPLACE_WAIT_S = 0
+    os.replace = flaky
+    try:
+        code, out = run(h, c, lite, work, "--only", "2026-09", "--full")
+    finally:
+        os.replace = real_replace
+        R.REPLACE_WAIT_S = ORIG["WAIT"]
+    check("T14 locked target retried and published", code == 0 and calls["n"] == 2 and "retry" in out, out[-300:])
+
+    # T15 verify catches a wrong value -> FAIL, previous lite file kept, no tmp
+    before = lite_files(lite)
+    real_transform = R.transform
+
+    def corrupt(pa_, pc_, t, schema, store, name):
+        out_t = real_transform(pa_, pc_, t, schema, store, name)
+        i = out_t.schema.get_field_index("AmountBuy_EUR")
+        col = pc.add(out_t.column(i), 0.01)
+        return out_t.set_column(i, out_t.schema.field(i), col)
+    R.transform = corrupt
+    try:
+        code, out = run(h, c, lite, work, "--only", "2026-09", "--full")
+    finally:
+        R.transform = real_transform
+    check("T15 verify FAILS on a changed copied value", code == 2 and "AmountBuy_EUR" in out, out[-400:])
+    check("T15 previous lite file kept, no tmp", lite_files(lite) == before
+          and not [n for n in os.listdir(os.path.join(lite, "_staging")) if n.endswith(".tmp")])
+
+    # T19 rounding column missing in one gold file -> that file FAILS, others built
+    bad = gold_table(2025, 6, 650, False, 2).drop(["RiskBrut_EUR"])
+    p25 = os.path.join(h, "FACT_ALLREPO_gold_2025.parquet")
+    keep25 = pq.read_table(p25)
+    write_gold(p25, bad)
+    before = lite_files(lite)
+    code, out = run(h, c, lite, work, "--full")
+    after = lite_files(lite)
+    k25 = os.path.join("hist", "FACT_ALLREPO_lite_2025.parquet")
+    check("T19 missing rounding column FAILS that file only",
+          code == 2 and after[k25] == before[k25] and sum(after[k] != before[k] for k in after) == 3, out[-300:])
+    write_gold(p25, keep25)
+    code, out = run(h, c, lite, work)
+    check("T19 fixed gold file rebuilt next run", code == 0 and any("2025" in x for x in built_lines(out)))
+
+    # T18 lock held -> FAIL
+    lockp = os.path.join(work, R.LOCK)
+    open(lockp, "w").close()
+    code, out = run(h, c, lite, work)
+    os.remove(lockp)
+    check("T18 second run refused while the lock is held", code == 2)
+
+    # T12 year in both gold folders -> FAIL, nothing written
+    before = lite_files(lite)
+    shutil.copy(os.path.join(h, "FACT_ALLREPO_gold_2025.parquet"), os.path.join(h, "FACT_ALLREPO_gold_2026.parquet"))
+    code, out = run(h, c, lite, work)
+    check("T12 year in hist and current gold FAILS, nothing written", code == 2 and lite_files(lite) == before)
+
+    # T20 annual roll: current 2026 months go, hist 2026 arrives -> hist lite built, current lite removed
+    t26 = pa.concat_tables([pq.read_table(os.path.join(c, n)).drop(["_SourceFile"]) for n in sorted(os.listdir(c))])
+    write_gold(os.path.join(h, "FACT_ALLREPO_gold_2026.parquet"), t26)
+    for n in os.listdir(c):
+        os.remove(os.path.join(c, n))
+    write_gold(os.path.join(c, "FACT_ALLREPO_gold_2027-01.parquet"), gold_table(2027, 1, 120, True, 9))
+    code, out = run(h, c, lite, work)
+    f5 = lite_files(lite)
+    check("T20 roll: hist 2026 + current 2027-01 built, current 2026 removed",
+          code == 0 and os.path.join("hist", "FACT_ALLREPO_lite_2026.parquet") in f5
+          and os.path.join("current", "FACT_ALLREPO_lite_2027-01.parquet") in f5
+          and not any("2026-" in k for k in f5), out[-500:])
+    check("T20 removed lines reported", out.count("Removed: ") == 2)
+    man = json.load(open(os.path.join(work, R.MANIFEST)))
+    check("T20 manifest has no entry for removed files", not any("2026-" in k for k in man["files"]))
+    code, out = run(h, c, lite, work)
+    check("T20 next run touches nothing", code == 0 and not built_lines(out) and lite_files(lite) == f5)
+
+    # T21 stray tmp from a crashed run removed (in _staging, and a legacy one in hist)
+    open(os.path.join(lite, "_staging", "hist_FACT_ALLREPO_lite_2024.parquet.tmp"), "w").close()
+    open(os.path.join(lite, "hist", "FACT_ALLREPO_lite_2024.parquet.tmp"), "w").close()
+    code, out = run(h, c, lite, work)
+    check("T21 stray .parquet.tmp removed", code == 0 and not any(k.endswith(".tmp") for k in lite_files(lite))
+          and not os.listdir(os.path.join(lite, "_staging")))
+
+    # T22 report written with fixed lines
+    rep = open(os.path.join(lite, "_reports", "allrepo_lite_last.txt"), encoding="utf-8").read()
+    check("T22 report has the fixed lines", all(x in rep for x in ("ALLREPO LITE BAKE", "env:", "config:", "folders:",
+                                                                   "Files:", "Lite folder:", "STATUS PASS")))
+    check("T22 job files beside hist and current, nothing else in the lite root",
+          sorted(os.listdir(lite)) == ["_lite_manifest.json", "_reports", "_staging", "current", "hist"],
+          sorted(os.listdir(lite)))
+    check("T22 hist and current hold lite parquet files only",
+          all(R.LITE_RX.match(os.path.basename(k)) for k in lite_files(lite)))
+
+
+def main():
+    reset_config()
+    root = tempfile.mkdtemp(prefix="allrepo_lite_selftest_")
+    try:
+        tests(root)
+    except Exception as ex:
+        import traceback
+        traceback.print_exc()
+        RESULTS.append(("crash: %s" % ex, False, ""))
+    finally:
+        reset_config()
+        shutil.rmtree(root, ignore_errors=True)
+    for name, ok, detail in RESULTS:
+        print("%s  %s%s" % ("ok  " if ok else "FAIL", name, "" if ok else "  " + str(detail)[:300]))
+    n_ok = sum(1 for _, ok, _ in RESULTS if ok)
+    print("SELFTEST %d/%d %s  (allrepo_lite_run BUILD %s, selftest BUILD %s)"
+          % (n_ok, len(RESULTS), "PASS" if n_ok == len(RESULTS) else "FAIL", R.BUILD, BUILD))
+    return 0 if n_ok == len(RESULTS) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

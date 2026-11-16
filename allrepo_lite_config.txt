@@ -1,0 +1,60 @@
+# =====================================================================================
+# allrepo_lite_config.py  -  BUILD 2026-11-16d
+# ALLREPO lite gold: every setting of the lite bake in one place
+# The lite bake READS the full gold and WRITES a second, separate set of files. The full gold and its job are never
+# changed. Re-include a column = remove it from DROP_COLUMNS (or a rounding = remove it from ROUND_COLUMNS), run
+# allrepo_lite_run.py, refresh. Any change below changes the config fingerprint, so the next run rebuilds every file by
+# itself (no --full needed); the report says "config changed".
+# =====================================================================================
+
+# ---- folders (office desktop) --------------------------------------------------------------------
+# Full gold, read only. Same folders as the live merged FACT_ALLREPO query.
+HIST_GOLD_DIR = r"G:\_CCC_Data\repo\ALLREPO\Historical - Parquet\ALLREPO_gold"
+CUR_GOLD_DIR = r"G:\_CCC_Data\repo\ALLREPO\Historical - Parquet\ALLREPO_gold_v2\current"
+# Lite root, as ALLREPO_gold_v2: the model reads hist\ (one file per year) and current\ (one file per month), top level
+# only. The job's own files sit beside them, never inside hist\ or current\:
+#   _staging\ (files being written, .parquet.tmp) · _reports\ (run reports) · _lite_manifest.json · _lite_run.lock
+# Must NOT sit inside either gold folder (Folder.Files is recursive); the bake refuses to start if it does.
+LITE_ROOT = r"G:\_CCC_Data\repo\ALLREPO\Historical - Parquet\ALLREPO_lite"
+
+# ---- file names ----------------------------------------------------------------------------------
+GOLD_PREFIX = "FACT_ALLREPO_gold_"     # gold hist FACT_ALLREPO_gold_YYYY.parquet, current FACT_ALLREPO_gold_YYYY-MM.parquet
+LITE_PREFIX = "FACT_ALLREPO_lite_"     # lite hist FACT_ALLREPO_lite_YYYY.parquet, current FACT_ALLREPO_lite_YYYY-MM.parquet
+
+# ---- LITE CONFIG v1.1 (Will, 16 Nov 2026) --------------------------------------------------------
+# Columns left out of the lite files. Every other gold column is copied unchanged.
+DROP_COLUMNS = [
+    "AmountBuy",            # original currency (AmountBuy_EUR stays)
+    "AmountSell",           # original currency (AmountSell_EUR stays)
+    # not loaded by the live FACT_ALLREPO query today (its Base list, 16 Nov): dropped so the lite model = today's model
+    "FO_ID",
+    "MarkToMark_EUR",
+    "MTMCash",              # original currency (MTMCash_EUR stays, rounded)
+    "MTMSecurity",          # original currency (MTMSecurity_EUR stays, rounded)
+    "SumAmountBuySell_EUR",
+    "TransactionId",        # removed from the model 9 Nov
+]
+
+# Columns rounded, as digits for round(): -3 = to the nearest EUR 1,000. Values stay in EUR (multiples of 1,000) under
+# the same names, so no measure changes. Rounding = half to even, then + 0.0 (no -0.0).
+ROUND_COLUMNS = {
+    "RiskNet_EUR": -3,
+    "RiskBrut_EUR": -3,
+    "CashAmount_EUR": -3,
+    "NotionalBond_EUR": -3,
+    "MTMSecurity_EUR": -3,
+    "MTMCash_EUR": -3,
+}
+
+# How the rounded columns are stored: "double" (Decimal number in Power BI, as today) or "int64" (Whole number).
+# Settled by the L6 type test (runsheet step 2): bake one month both ways into scratch folders and compare the model
+# size. int64 needs every ROUND_COLUMNS digit <= 0.
+ROUND_STORE = "double"
+
+# Hist gold files have no _SourceFile column (the live M adds it per row). The lite bake writes it into the hist lite
+# files, with the SAME value the live M uses (the gold yearly file name), so every lite file has one column set and the
+# M needs no per-row step.
+SOURCE_FILE_COLUMN = "_SourceFile"
+
+# Rows per row group in the lite files (Power BI reads Parquet row group by row group).
+ROW_GROUP_ROWS = 1_048_576
