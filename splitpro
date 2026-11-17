@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+# =====================================================================================
+# allrepo_split_probe.py  -  BUILD 2026-11-17a  -  READ-ONLY (opens gold and lite files, writes nothing but a report)
+# Why does the model miss whole 2025 / 2026 dates in core (17 Nov LITER check: 2023-24 exact, 2025 -272,441 rows,
+# 2026 -379,288, 36 dates absent)? Suspect: SLA_CateCode / Category written differently on some files (case, spaces).
+# Power BI compares text case-insensitively and keeps ONE spelling per value, so the model shows "07L" for both
+# "07L" and "07l"; the bake compares exactly, so "07l" rows went to the extension.
+# Prints, per gold file: every raw SLA_CateCode spelling (repr) with rows; Category spellings that are FCG21 apart from
+# case / spaces; then the dates whose 07L rows (any spelling) are not in the core files, with the spellings on those dates.
+# Run (code folder):  python allrepo_split_probe.py      (uses the folders in allrepo_lite_config.py)
+# =====================================================================================
+import collections
+import os
+import sys
+import time
+
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
+
+import allrepo_lite_config as C
+import allrepo_lite_run as R
+
+
+def main():
+    t0 = time.time()
+    gold = R.list_gold(C.HIST_GOLD_DIR, C.CUR_GOLD_DIR)
+    print("allrepo_split_probe BUILD 2026-11-17a · %d gold file(s)" % len(gold))
+    spell = collections.Counter()
+    cat_var = collections.Counter()
+    gold_07l = collections.Counter()        # date -> 07L rows, any spelling
+    odd_by_date = collections.defaultdict(collections.Counter)
+    for i, (side, period, gp, rel) in enumerate(gold, 1):
+        pf = pq.ParquetFile(gp)
+        for b in pf.iter_batches(batch_size=1_048_576, columns=["SnapshotDate", "SLA_CateCode", "Category"]):
