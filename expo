@@ -1,0 +1,27 @@
+// =====================================================================================
+// ALLREPO_LITE_IDS_EXPORT.dax  -  BUILD 2026-11-17a  -  read-only
+// Exports the intra-group ids for the lite bake (runsheet step 3a): one column, HeadOfficeSirisId, every CPY flagged
+// DIM_COUNTERPARTY[IsIntraGroup], MINUS the CPGs whose CPG_Name_Final contains one of the keywords in _kw (17 Nov: the
+// group-managed fund ranges are a different kind of intra-group and are not thinned). Ids only - no names in the file.
+// _kw: type the real CPG name keywords at work; keep the SAME list as in ALLREPO_LITE_IDS_REVIEW.dax (check it there
+// first). Case-insensitive "contains". The placeholders match nothing.
+// DAX Studio: Output (ribbon) > File > CSV, run, save as
+//   H:\Documents\Python\ALLREPO_Lite\allrepo_lite_intragroup_ids.csv
+// Do NOT round-trip it through Excel (leading zeros); if it happens, the bake puts them back and counts them.
+// Re-export whenever IsIntraGroup or the keywords change; the next bake rebuilds every file (the id list is in its fingerprint).
+// =====================================================================================
+DEFINE
+    VAR _kw = { "replace with CPG name keyword 1", "replace with CPG name keyword 2" }
+
+EVALUATE
+VAR _e =
+    ADDCOLUMNS (
+        CALCULATETABLE ( VALUES ( DIM_COUNTERPARTY[HeadOfficeSirisId] ), DIM_COUNTERPARTY[IsIntraGroup] = TRUE () ),
+        "@cpg", UPPER ( CALCULATE ( MAX ( DIM_COUNTERPARTY[CPG_Name_Final] ) ) )
+    )
+RETURN
+    SELECTCOLUMNS (
+        FILTER ( _e, ISEMPTY ( FILTER ( _kw, CONTAINSSTRING ( [@cpg], UPPER ( [Value] ) ) ) ) ),
+        "HeadOfficeSirisId", DIM_COUNTERPARTY[HeadOfficeSirisId]
+    )
+ORDER BY [HeadOfficeSirisId]
