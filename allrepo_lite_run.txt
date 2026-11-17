@@ -1,89 +1,879 @@
 #!/usr/bin/env python3
 # =====================================================================================
-# allrepo_split_probe.py  -  BUILD 2026-11-17a  -  READ-ONLY (opens gold and lite files, writes nothing but a report)
-# Why does the model miss whole 2025 / 2026 dates in core (17 Nov LITER check: 2023-24 exact, 2025 -272,441 rows,
-# 2026 -379,288, 36 dates absent)? Suspect: SLA_CateCode / Category written differently on some files (case, spaces).
-# Power BI compares text case-insensitively and keeps ONE spelling per value, so the model shows "07L" for both
-# "07L" and "07l"; the bake compares exactly, so "07l" rows went to the extension.
-# Prints, per gold file: every raw SLA_CateCode spelling (repr) with rows; Category spellings that are FCG21 apart from
-# case / spaces; then the dates whose 07L rows (any spelling) are not in the core files, with the spellings on those dates.
-# Run (code folder):  python allrepo_split_probe.py      (uses the folders in allrepo_lite_config.py)
+# allrepo_lite_run.py  -  BUILD 2026-11-17a
+# ALLREPO lite gold bake (claude/merge/ALLREPO_LITE_HANDOFF.md). Reads the FULL gold, writes the LITE gold, split in
+# two parts that together hold every gold row exactly once:
+#   CORE      hist\FACT_ALLREPO_lite_YYYY.parquet  ·  current\FACT_ALLREPO_lite_YYYY-MM.parquet      (loaded by default)
+#   EXTENSION ext_hist\ (same names)               ·  ext_current\ (same names)                     (ALLREPO_SCOPE = full)
+# Settings: allrepo_lite_config.py (drop list, rounding, store type, split rule, folders). The full gold is opened
+# read-only and never changed. No pandas in the data path (Arrow only): dates and ids pass through untouched.
+#
+# Split rule (LITE CONFIG v1.3, config SPLIT section). "Window dates" = the last file date of every calendar month
+# (month-ends) + every file date within RECENT_DAYS of the latest file date. A row is CORE when:
+#   SLA_CateCode = REPO_SLA (07L), unless its Category is in THIN_CATEGORIES (CCPs) or its HeadOfficeSirisId is in the
+#       intra-group id file - those repo rows are core on window dates only;
+#   or SLA_CateCode is in WINDOW_SLA (07K securities lending) and the date is a window date.
+# SLA_CateCode and Category are compared as Power BI compares text: case-insensitive, spaces trimmed ("07l", " 07L"
+# count as 07L; 17 Nov: exact comparison sent whole 2025 / 2026 dates to the extension). Values are copied unchanged;
+# rows written in another spelling are counted in the report.
+# Every other row goes to the EXTENSION. As the latest date moves, rows that leave the window move core -> extension:
+# the file holding them is rebuilt (its "window signature" changed).
+#
+# Per gold file: drop DROP_COLUMNS, round ROUND_COLUMNS (half to even, + 0.0), add _SourceFile to hist files (= gold
+# file name, the value the live M added), split, write both parts to _staging\*.parquet.tmp, VERIFY both against the gold
+# file (core + extension rows = gold rows; every copied column identical value by value; every rounded column = the
+# rounding of the gold value; each row in the part the rule gives it), then os.replace both (retry while Power BI holds a
+# file). A file that fails is not published: its previous lite files stay, the run exits 2.
+#
+# Incremental: a file pair is rebuilt only when its gold file changed (size / mtime_ns), the config or the intra-group
+# id list changed (fingerprint), its window signature changed, a lite file is missing or was changed outside the job,
+# or --full. Lite files whose gold file is gone (annual roll) are removed AFTER the new files are written.
+#
+# Run (office desktop, Start in = the code folder):
+#   python allrepo_lite_run.py                       daily (after the ALLREPO gold job)
+#   python allrepo_lite_run.py --full                rebuild every file
+#   python allrepo_lite_run.py --only 2025,2026-10   build these periods only (no orphan removal)
+#   L6 type test: --only 2026-10 --round-store int64 --lite-root <scratch folder>
+# Job files live in the lite root beside the four data folders (as ALLREPO_gold_v2): _staging\, _reports\,
+# _lite_manifest.json, _lite_run.lock. The model reads hist\ current\ (+ ext_hist\ ext_current\ in full scope), top level.
+# Exit: 0 PASS · 1 WARN · 2 FAIL
 # =====================================================================================
-import collections
+import argparse
+import datetime as dt
+import hashlib
+import json
 import os
+import re
 import sys
 import time
 
-import pyarrow as pa
-import pyarrow.compute as pc
-import pyarrow.parquet as pq
-
 import allrepo_lite_config as C
-import allrepo_lite_run as R
+
+BUILD = "2026-11-17a"
+LOGIC_VERSION = "lite-logic-3"      # bump only when the OUTPUT logic changes (forces a rebuild of every file)
+PINNED = {"python": "3.10", "numpy": "1.21.5", "pandas": "1.3.5", "pyarrow": "24.0.0"}
+HIST_RX = re.compile(r"^%s(\d{4})\.parquet$" % re.escape(C.GOLD_PREFIX), re.I)
+CUR_RX = re.compile(r"^%s(\d{4})-(\d{2})\.parquet$" % re.escape(C.GOLD_PREFIX), re.I)
+LITE_RX = re.compile(r"^%s(\d{4}(?:-\d{2})?)\.parquet$" % re.escape(C.LITE_PREFIX), re.I)
+DATE_COLUMN = "SnapshotDate"
+SLA_COLUMN = "SLA_CateCode"
+CAT_COLUMN = "Category"
+ID_COLUMN = "HeadOfficeSirisId"
+SPLIT_COLUMNS = (DATE_COLUMN, SLA_COLUMN, CAT_COLUMN, ID_COLUMN)
+DATA_FOLDERS = ("hist", "current", "ext_hist", "ext_current")
+MANIFEST = "_lite_manifest.json"
+LOCK = "_lite_run.lock"
+STAGING = "_staging"
+REPORTS = "_reports"
+LOCK_STALE_S = 6 * 3600
+REPLACE_TRIES, REPLACE_WAIT_S = 6, 10
+SLICE_ROWS = 262_144
 
 
-def main():
-    t0 = time.time()
-    gold = R.list_gold(C.HIST_GOLD_DIR, C.CUR_GOLD_DIR)
-    print("allrepo_split_probe BUILD 2026-11-17a · %d gold file(s)" % len(gold))
-    spell = collections.Counter()
-    cat_var = collections.Counter()
-    gold_07l = collections.Counter()        # date -> 07L rows, any spelling
-    odd_by_date = collections.defaultdict(collections.Counter)
-    for i, (side, period, gp, rel) in enumerate(gold, 1):
-        pf = pq.ParquetFile(gp)
-        for b in pf.iter_batches(batch_size=1_048_576, columns=["SnapshotDate", "SLA_CateCode", "Category"]):
-            d = R.to_date32(pa, pc, b.column(0))
-            sla = pc.cast(b.column(1), pa.string())
-            cat = pc.cast(b.column(2), pa.string())
-            t = pa.table({"d": d, "s": sla, "c": cat})
-            for s, n in zip(*[x.to_pylist() for x in pc.value_counts(sla).flatten()]):
-                spell[(period, s)] += n
-            norm_s = pc.utf8_upper(pc.utf8_trim_whitespace(sla))
-            norm_c = pc.utf8_upper(pc.utf8_trim_whitespace(cat))
-            odd_c = pc.and_(pc.fill_null(pc.equal(norm_c, "FCG21"), False), pc.fill_null(pc.not_equal(cat, "FCG21"), False))
-            for v, n in zip(*[x.to_pylist() for x in pc.value_counts(pc.filter(cat, odd_c)).flatten()]):
-                cat_var[(period, v)] += n
-            is07 = pc.fill_null(pc.equal(norm_s, "07L"), False)
-            g = pa.table({"d": pc.filter(d, is07)}).group_by("d").aggregate([("d", "count")])
-            for dd, n in zip(g.column("d").to_pylist(), g.column("d_count").to_pylist()):
-                gold_07l[dd] += n
-            odd = pc.and_(is07, pc.fill_null(pc.not_equal(sla, "07L"), False))
-            if pc.any(odd).as_py():
-                g2 = pa.table({"d": pc.filter(d, odd), "s": pc.filter(sla, odd)}).group_by(["d", "s"]).aggregate([("d", "count")])
-                for dd, s, n in zip(*[g2.column(x).to_pylist() for x in ("d", "s", "d_count")]):
-                    odd_by_date[dd][repr(s)] += n
-        print("%d/%d %s  %.0f s" % (i, len(gold), os.path.basename(gp), time.time() - t0))
-    core_07l = collections.Counter()
-    for side, period, gp, rel in gold:
-        lp = os.path.join(C.LITE_ROOT, rel)
-        if not os.path.exists(lp):
-            print("core file missing: %s" % lp)
+# ----------------------------------------------------------------------------------- environment
+def check_versions():
+    import numpy
+    import pandas
+    import pyarrow
+    found = {"python": "%d.%d" % sys.version_info[:2], "numpy": numpy.__version__,
+             "pandas": pandas.__version__, "pyarrow": pyarrow.__version__}
+    return [("%s %s (want %s)" % (k, found[k], v)) for k, v in PINNED.items() if found[k] != v], found
+
+
+def norm(p):
+    return os.path.normcase(os.path.abspath(p))
+
+
+def inside(child, parent):
+    c, p = norm(child), norm(parent)
+    return c == p or c.startswith(p.rstrip("\\/") + os.sep)
+
+
+def ext_rel(rel):
+    return "ext_" + rel                               # rel starts with "hist" or "current"
+
+
+def config_fingerprint(store, ids_hash):
+    body = json.dumps({"logic": LOGIC_VERSION, "drop": sorted(C.DROP_COLUMNS),
+                       "round": sorted(C.ROUND_COLUMNS.items()), "store": store,
+                       "prefix": C.LITE_PREFIX, "srccol": C.SOURCE_FILE_COLUMN, "rg": C.ROW_GROUP_ROWS,
+                       "split": [C.REPO_SLA, sorted(C.WINDOW_SLA), sorted(C.THIN_CATEGORIES), C.RECENT_DAYS],
+                       "ids": ids_hash}, sort_keys=True)
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+
+
+# ----------------------------------------------------------------------------------- intra-group ids
+def read_ids(path):
+    """(sorted padded ids, number padded, problems). Ids-only CSV: one id per line, optional header, quotes allowed."""
+    ids, padded, problems = set(), 0, []
+    if not path or not os.path.isfile(path):
+        return [], 0, ["intra-group id file not found: %s (runsheet step 3a exports it)" % path]
+    with open(path, encoding="utf-8-sig") as fh:
+        lines = [ln.strip().strip('"').strip() for ln in fh]
+    for i, v in enumerate(lines):
+        if not v:
             continue
-        for b in pq.ParquetFile(lp).iter_batches(batch_size=1_048_576, columns=["SnapshotDate", "SLA_CateCode"]):
-            d = R.to_date32(pa, pc, b.column(0))
-            is07 = pc.fill_null(pc.equal(pc.utf8_upper(pc.utf8_trim_whitespace(pc.cast(b.column(1), pa.string()))), "07L"), False)
-            g = pa.table({"d": pc.filter(d, is07)}).group_by("d").aggregate([("d", "count")])
-            for dd, n in zip(g.column("d").to_pylist(), g.column("d_count").to_pylist()):
-                core_07l[dd] += n
+        if i == 0 and not v.isdigit() and any(ch.isalpha() for ch in v):
+            continue                                  # header line
+        if not v.isdigit() or len(v) > 10:
+            problems.append("line %d: %r is not an id of up to 10 digits" % (i + 1, v[:30]))
+            continue
+        if len(v) < 10:
+            padded += 1                               # Excel / DAX export lost the leading zeros: put them back
+        ids.add(v.zfill(10))
+    if not ids and not problems:
+        problems.append("intra-group id file has no id: %s" % path)
+    return sorted(ids), padded, problems
 
-    print("\nA. SLA_CateCode spellings per gold file (repr, rows)")
-    for (period, s), n in sorted(spell.items(), key=lambda kv: (kv[0][0], str(kv[0][1]))):
-        print("   %-8s %-12r %12s" % (period, s, format(n, ",")))
-    print("\nB. Category spellings equal to FCG21 apart from case / spaces (repr, rows): %s" % (
-        "none" if not cat_var else ""))
-    for (period, v), n in sorted(cat_var.items()):
-        print("   %-8s %-12r %12s" % (period, v, format(n, ",")))
-    missing = sorted(d for d in gold_07l if core_07l.get(d, 0) == 0)
-    print("\nC. dates with 07L rows in the gold and NONE in the core files: %d" % len(missing))
-    for d in missing:
-        print("   %s  gold 07L rows %s  spellings %s" % (d, format(gold_07l[d], ","), dict(odd_by_date.get(d, {})) or "-"))
-    part = sorted(d for d in gold_07l if 0 < core_07l.get(d, 0) and d in odd_by_date)
-    print("\nD. dates with some 07L rows in another spelling (core holds part of them): %d" % len(part))
-    for d in part[:40]:
-        print("   %s  %s" % (d, dict(odd_by_date[d])))
-    print("\ndone in %.0f s" % (time.time() - t0))
-    return 0
+
+# ----------------------------------------------------------------------------------- files
+def list_gold(hist_dir, cur_dir):
+    """[(side, period, gold_path, lite_rel)] top level only (like the M query)."""
+    out = []
+    for d, rx, side in ((hist_dir, HIST_RX, "hist"), (cur_dir, CUR_RX, "current")):
+        for n in sorted(os.listdir(d)):
+            m = rx.match(n)
+            if not m or not os.path.isfile(os.path.join(d, n)):
+                continue
+            period = m.group(1) if side == "hist" else "%s-%s" % (m.group(1), m.group(2))
+            out.append((side, period, os.path.join(d, n), os.path.join(side, C.LITE_PREFIX + period + ".parquet")))
+    return out
+
+
+def stat_of(path):
+    s = os.stat(path)
+    return {"size": s.st_size, "mtime_ns": s.st_mtime_ns}
+
+
+def load_manifest(work):
+    p = os.path.join(work, MANIFEST)
+    if not os.path.exists(p):
+        return {"files": {}, "prescan": {}}
+    with open(p, encoding="utf-8") as fh:
+        m = json.load(fh)
+    m.setdefault("files", {})
+    m.setdefault("prescan", {})
+    return m
+
+
+def save_manifest(work, man):
+    p = os.path.join(work, MANIFEST)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(man, fh, indent=1, sort_keys=True)
+    os.replace(tmp, p)
+
+
+def take_lock(work, warns):
+    p = os.path.join(work, LOCK)
+    try:
+        fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        age = time.time() - os.path.getmtime(p)
+        if age < LOCK_STALE_S:
+            return None
+        warns.append("stale lock removed (%.1f h old): a previous run did not finish" % (age / 3600))
+        os.remove(p)
+        fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    os.write(fd, ("%d %s" % (os.getpid(), dt.datetime.now().isoformat())).encode())
+    os.close(fd)
+    return p
+
+
+def replace_with_retry(src, dst, sleep=time.sleep):
+    for i in range(REPLACE_TRIES):
+        try:
+            os.replace(src, dst)
+            return i
+        except PermissionError:
+            if i == REPLACE_TRIES - 1:
+                raise
+            print("   target locked (Power BI open?), retry %d/%d in %d s" % (i + 1, REPLACE_TRIES - 1, REPLACE_WAIT_S))
+            sleep(REPLACE_WAIT_S)
+    return REPLACE_TRIES
+
+
+# ----------------------------------------------------------------------------------- dates and window
+def to_date32(pa, pc, col):
+    if pa.types.is_date32(col.type):
+        return col
+    return pc.cast(col, pa.date32())                  # timestamp / date64 -> calendar date
+
+
+def prescan(pa, pc, pq, gold, man, ids, ids_hash):
+    """Distinct dates per gold file (+ intra-group ids found), cached in the manifest by gold size / mtime_ns."""
+    cache = man.setdefault("prescan", {})
+    dates_by, found = {}, set()
+    ids_arr = pa.array(ids, pa.string()) if ids else None
+    t0 = time.time()
+    for i, (side, period, gp, rel) in enumerate(gold, 1):
+        gs = stat_of(gp)
+        key = os.path.basename(gp)
+        e = cache.get(key)
+        if e and e.get("size") == gs["size"] and e.get("mtime_ns") == gs["mtime_ns"] and e.get("ids") == ids_hash:
+            dates_by[gp] = [dt.date.fromisoformat(x) for x in e["dates"]]
+            found.update(e["found"])
+            continue
+        pf = pq.ParquetFile(gp)
+        dset, fset = set(), set()
+        cols = [DATE_COLUMN] + ([ID_COLUMN] if ids_arr is not None and ID_COLUMN in pf.schema_arrow.names else [])
+        for b in pf.iter_batches(batch_size=1_048_576, columns=cols):
+            dset.update(x for x in pc.unique(to_date32(pa, pc, b.column(0))).to_pylist() if x is not None)
+            if len(cols) > 1:
+                idc = pc.cast(b.column(1), pa.string())
+                fset.update(pc.unique(pc.filter(idc, pc.fill_null(pc.is_in(idc, value_set=ids_arr), False))).to_pylist())
+        if hasattr(pf, "close"):
+            pf.close()
+        dates_by[gp] = sorted(dset)
+        found.update(fset)
+        cache[key] = {"size": gs["size"], "mtime_ns": gs["mtime_ns"], "ids": ids_hash,
+                      "dates": [d.isoformat() for d in sorted(dset)], "found": sorted(fset)}
+        print("prescan %d/%d  %-36s %4d dates  %.1f s" % (i, len(gold), key, len(dset), time.time() - t0))
+    for k in [k for k in cache if k not in {os.path.basename(g[2]) for g in gold}]:
+        del cache[k]
+    return dates_by, found
+
+
+def window_dates(all_dates):
+    """(anchor, month_ends, window set). Month-end = the last file date present in each calendar month."""
+    anchor = max(all_dates)
+    last = {}
+    for d in all_dates:
+        k = (d.year, d.month)
+        if k not in last or d > last[k]:
+            last[k] = d
+    month_ends = set(last.values())
+    recent = {d for d in all_dates if (anchor - d).days <= C.RECENT_DAYS}
+    return anchor, month_ends, month_ends | recent
+
+
+def window_sig(file_dates, window):
+    inw = [d.isoformat() for d in file_dates if d in window]
+    return hashlib.sha256((",".join(inw)).encode()).hexdigest()[:16]
+
+
+def key(pa, pc, col):
+    """Text as Power BI compares it: trimmed, upper case (null stays null)."""
+    return pc.utf8_upper(pc.utf8_trim_whitespace(pc.cast(col, pa.string())))
+
+
+def ckey(v):
+    return v.strip().upper()
+
+
+def spelling_variants(pa, pc, t):
+    """Rows whose SLA_CateCode or Category differs from its trimmed upper-case form (e.g. "07l", "FCG21 ")."""
+    n = 0
+    for col in (SLA_COLUMN, CAT_COLUMN):
+        raw = pc.cast(t.column(col), pa.string())
+        n += pc.sum(pc.cast(pc.fill_null(pc.not_equal(raw, key(pa, pc, raw)), False), pa.int64())).as_py() or 0
+    return n
+
+
+def core_mask(pa, pc, t, win_arr, ids_arr):
+    """Boolean array: True = CORE row (config SPLIT rule), False = EXTENSION row. Nulls never core by accident."""
+    f = lambda x: pc.fill_null(x, False)
+    win = f(pc.is_in(to_date32(pa, pc, t.column(DATE_COLUMN)), value_set=win_arr))
+    sla = key(pa, pc, t.column(SLA_COLUMN))
+    cat = key(pa, pc, t.column(CAT_COLUMN))
+    thin = f(pc.is_in(cat, value_set=pa.array(sorted(ckey(x) for x in C.THIN_CATEGORIES), pa.string())))
+    if ids_arr is not None:
+        thin = pc.or_(thin, f(pc.is_in(pc.utf8_trim_whitespace(pc.cast(t.column(ID_COLUMN), pa.string())),
+                                       value_set=ids_arr)))
+    repo = f(pc.equal(sla, ckey(C.REPO_SLA)))
+    wsla = f(pc.is_in(sla, value_set=pa.array(sorted(ckey(x) for x in C.WINDOW_SLA), pa.string())))
+    return f(pc.or_(pc.and_(repo, pc.or_(pc.invert(thin), win)), pc.and_(wsla, win)))
+
+
+# ----------------------------------------------------------------------------------- transform
+def round_col(pa, pc, x, nd, store):
+    """Round to nd digits (nd < 0: to 10^-nd), half to even, + 0.0 (no -0.0); cast to int64 if store says so."""
+    x = pc.cast(x, pa.float64())
+    if nd >= 0:
+        r = pc.round(x, ndigits=nd, round_mode="half_to_even")
+    else:
+        f = 10.0 ** (-nd)
+        r = pc.multiply(pc.round(pc.divide(x, f), round_mode="half_to_even"), f)
+    r = pc.add(r, 0.0)
+    if store == "int64":
+        r = pc.cast(r, pa.int64())          # safe cast: fails on any fraction, NaN or overflow instead of truncating
+    return r
+
+
+def out_schema(pa, src_schema, side, store):
+    fields = []
+    for f in src_schema:
+        if f.name in C.DROP_COLUMNS:
+            continue
+        if f.name in C.ROUND_COLUMNS:
+            f = pa.field(f.name, pa.int64() if store == "int64" else pa.float64(), nullable=True)
+        fields.append(f)
+    if side == "hist" and C.SOURCE_FILE_COLUMN not in src_schema.names:
+        fields.append(pa.field(C.SOURCE_FILE_COLUMN, pa.string(), nullable=True))
+    return pa.schema(fields)
+
+
+def transform(pa, pc, t, schema, store, src_name):
+    cols = []
+    for f in schema:
+        if f.name == C.SOURCE_FILE_COLUMN and f.name not in t.column_names:
+            cols.append(pa.array([src_name] * t.num_rows, pa.string()))
+        elif f.name in C.ROUND_COLUMNS:
+            cols.append(round_col(pa, pc, t.column(f.name), C.ROUND_COLUMNS[f.name], store))
+        else:
+            cols.append(t.column(f.name))
+    return pa.table(cols, schema=schema)
+
+
+def slices(pq_file, columns, n=SLICE_ROWS):
+    for b in pq_file.iter_batches(batch_size=n, columns=columns):
+        yield b
+
+
+class RowStream:
+    """Reads a Parquet file in order, n rows at a time, whatever its batch boundaries."""
+    def __init__(self, pa, pf):
+        self.pa, self.schema = pa, pf.schema_arrow
+        self.it = pf.iter_batches(batch_size=SLICE_ROWS)
+        self.buf, self.n, self.done = [], 0, False
+
+    def take(self, k):
+        while self.n < k and not self.done:
+            try:
+                b = next(self.it)
+                self.buf.append(b)
+                self.n += b.num_rows
+            except StopIteration:
+                self.done = True
+        t = self.pa.Table.from_batches(self.buf, schema=self.schema)
+        out = t.slice(0, min(k, t.num_rows))
+        rest = t.slice(out.num_rows)
+        self.buf, self.n = rest.to_batches(), rest.num_rows
+        return out
+
+
+class PartWriter:
+    def __init__(self, pq, pa, path, schema, codec, version):
+        self.pa, self.schema = pa, schema
+        self.w = pq.ParquetWriter(path, schema, compression=codec, version=version, use_dictionary=True)
+        self.pend, self.n, self.rows = [], 0, 0
+
+    def add(self, tbl):
+        self.rows += tbl.num_rows
+        for rb in tbl.to_batches():
+            self.pend.append(rb)
+            self.n += rb.num_rows
+        if self.n >= C.ROW_GROUP_ROWS:
+            big = self.pa.Table.from_batches(self.pend, schema=self.schema)
+            self.w.write_table(big.slice(0, C.ROW_GROUP_ROWS), row_group_size=C.ROW_GROUP_ROWS)
+            rest = big.slice(C.ROW_GROUP_ROWS)
+            self.pend, self.n = rest.to_batches(), rest.num_rows
+
+    def close(self):
+        try:
+            if self.pend:
+                self.w.write_table(self.pa.Table.from_batches(self.pend, schema=self.schema),
+                                   row_group_size=C.ROW_GROUP_ROWS)
+        finally:
+            self.w.close()
+
+
+def same_values(pa, pc, a, b):
+    """Value-by-value equality, nulls in the same places, NaN equal to NaN."""
+    if a.type != b.type:
+        return False
+    if a.equals(b):
+        return True
+    if not pa.types.is_floating(a.type):
+        return False
+    a, b = a.combine_chunks() if hasattr(a, "combine_chunks") else a, b.combine_chunks() if hasattr(b, "combine_chunks") else b
+    if not pc.all(pc.equal(pc.is_null(a), pc.is_null(b))).as_py():
+        return False
+    na, nb = pc.is_nan(a), pc.is_nan(b)
+    ok = pc.or_kleene(pc.equal(a, b), pc.and_(na, nb))
+    return bool(pc.all(pc.fill_null(ok, True)).as_py())
+
+
+def compare_part(pa, pc, g, got, schema, store, name):
+    """Columns of `got` that differ from the gold rows `g` (copied: identical; rounded: = rounding of gold)."""
+    bad = []
+    for f in schema:
+        if f.name == C.SOURCE_FILE_COLUMN and f.name not in g.column_names:
+            col = got.column(f.name)
+            ok = col.null_count == 0 and (got.num_rows == 0 or pc.all(pc.equal(col, name)).as_py())
+        elif f.name in C.ROUND_COLUMNS:
+            ok = same_values(pa, pc, round_col(pa, pc, g.column(f.name), C.ROUND_COLUMNS[f.name], store), got.column(f.name))
+        else:
+            ok = same_values(pa, pc, g.column(f.name), got.column(f.name))
+        if not ok:
+            bad.append(f.name)
+    return bad
+
+
+# ----------------------------------------------------------------------------------- one file
+def bake_file(pa, pc, pq, side, gold_path, core_path, ext_path, store, staging, win_arr, ids_arr):
+    """Build, verify, publish one core + extension pair. Returns (ok, info, messages)."""
+    t0 = time.time()
+    msgs = []
+    pf = pq.ParquetFile(gold_path)
+    src = pf.schema_arrow
+    name = os.path.basename(gold_path)
+    missing = [c for c in list(C.ROUND_COLUMNS) + list(SPLIT_COLUMNS) if c not in src.names]
+    if missing:
+        return False, None, ["FAIL  %s: rounding / split column(s) missing: %s" % (name, ", ".join(missing))]
+    bad_type = [c for c in C.ROUND_COLUMNS
+                if not (pa.types.is_floating(src.field(c).type) or pa.types.is_integer(src.field(c).type))]
+    if bad_type:
+        return False, None, ["FAIL  %s: rounding column(s) not numeric: %s" % (name, ", ".join(bad_type))]
+    absent_drop = [c for c in C.DROP_COLUMNS if c not in src.names]
+    if absent_drop:
+        msgs.append("INFO  %s: drop column(s) not in this file: %s" % (name, ", ".join(absent_drop)))
+    schema = out_schema(pa, src, side, store)
+    md = pf.metadata
+    codec = md.row_group(0).column(0).compression.lower() if md.num_row_groups else "snappy"
+    codec = "none" if codec == "uncompressed" else codec
+    version = md.format_version if md.format_version in ("1.0", "2.4", "2.6") else "2.6"
+    os.makedirs(staging, exist_ok=True)
+    tmps = {}
+    for part, path in (("core", core_path), ("ext", ext_path)):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmps[part] = os.path.join(staging, part + "_" + side + "_" + os.path.basename(path) + ".tmp")
+        if os.path.exists(tmps[part]):
+            os.remove(tmps[part])
+
+    rc = list(C.ROUND_COLUMNS)
+    stats = {c: {"sum_raw": 0.0, "sum_lite": 0.0, "max_row": 0.0, "nulls_raw": 0, "nulls_lite": 0, "nan_raw": 0,
+                 "to_zero": 0, "neg_zero": 0} for c in rc}
+    day_err = {c: {} for c in rc}
+    rows = 0
+    variants = 0
+    # ---- build
+    wc = PartWriter(pq, pa, tmps["core"], schema, codec, version)
+    we = PartWriter(pq, pa, tmps["ext"], schema, codec, version)
+    try:
+        for b in slices(pf, None):
+            t = pa.Table.from_batches([b])
+            lt = transform(pa, pc, t, schema, store, name)
+            mask = core_mask(pa, pc, t, win_arr, ids_arr)
+            variants += spelling_variants(pa, pc, t)
+            rows += t.num_rows
+            for c in rc:
+                raw = pc.cast(t.column(c), pa.float64())
+                lite = pc.cast(lt.column(c), pa.float64())
+                err = pc.subtract(raw, lite)
+                s = stats[c]
+                s["sum_raw"] += pc.sum(raw).as_py() or 0.0
+                s["sum_lite"] += pc.sum(lite).as_py() or 0.0
+                s["max_row"] = max(s["max_row"], pc.max(pc.abs(err)).as_py() or 0.0)
+                s["nulls_raw"] += raw.null_count
+                s["nulls_lite"] += lite.null_count
+                s["nan_raw"] += pc.sum(pc.cast(pc.fill_null(pc.is_nan(raw), False), pa.int64())).as_py() or 0
+                s["to_zero"] += pc.sum(pc.cast(pc.fill_null(pc.and_(pc.not_equal(raw, 0.0), pc.equal(lite, 0.0)),
+                                                            False), pa.int64())).as_py() or 0
+                if store == "double":
+                    nz = pc.and_(pc.equal(lite, 0.0), pc.less(pc.divide(1.0, lite), 0.0))
+                    s["neg_zero"] += pc.sum(pc.cast(pc.fill_null(nz, False), pa.int64())).as_py() or 0
+                g = pa.table({"d": t.column(DATE_COLUMN), "e": err}).group_by("d").aggregate([("e", "sum")])
+                de = day_err[c]
+                for d, e in zip(g.column("d").to_pylist(), g.column("e_sum").to_pylist()):
+                    de[d] = de.get(d, 0.0) + (e or 0.0)
+            wc.add(lt.filter(mask))
+            we.add(lt.filter(pc.invert(mask)))
+    finally:
+        wc.close()
+        we.close()
+    t_build = time.time() - t0
+
+    # ---- verify both parts against the gold file
+    problems = []
+    cf, ef = pq.ParquetFile(tmps["core"]), pq.ParquetFile(tmps["ext"])
+    if rows != md.num_rows or cf.metadata.num_rows + ef.metadata.num_rows != md.num_rows:
+        problems.append("rows gold %d, read %d, core %d + ext %d" % (md.num_rows, rows, cf.metadata.num_rows,
+                                                                     ef.metadata.num_rows))
+    for part, h in (("core", cf), ("ext", ef)):
+        if not h.schema_arrow.equals(schema, check_metadata=False):
+            problems.append("%s schema differs from the expected schema" % part)
+    for c in rc:
+        if stats[c]["nulls_raw"] != stats[c]["nulls_lite"]:
+            problems.append("%s nulls %d -> %d" % (c, stats[c]["nulls_raw"], stats[c]["nulls_lite"]))
+        if stats[c]["neg_zero"]:
+            problems.append("%s has %d -0.0 values" % (c, stats[c]["neg_zero"]))
+        half = 0.5 * 10.0 ** (-C.ROUND_COLUMNS[c])
+        if stats[c]["max_row"] > half * (1 + 1e-9):       # arithmetic invariant of rounding, not a tolerance
+            problems.append("%s row error %.6f above half a rounding step %.6f" % (c, stats[c]["max_row"], half))
+    if not problems:
+        mism = set()
+        cs, es = RowStream(pa, cf), RowStream(pa, ef)
+        for b in slices(pf, None):
+            g = pa.Table.from_batches([b])
+            m = core_mask(pa, pc, g, win_arr, ids_arr)
+            for part, stream, gm in (("core", cs, g.filter(m)), ("ext", es, g.filter(pc.invert(m)))):
+                got = stream.take(gm.num_rows)
+                if got.num_rows != gm.num_rows:
+                    problems.append("%s part ends before the gold rows it should hold" % part)
+                    break
+                mism.update("%s.%s" % (part, x) for x in compare_part(pa, pc, gm, got, schema, store, name))
+            if problems:
+                break
+        if not problems and (cs.take(1).num_rows or es.take(1).num_rows):
+            problems.append("a part holds rows the gold does not")
+        if mism:
+            problems.append("values differ from the gold in: " + ", ".join(sorted(mism)))
+    t_verify = time.time() - t0 - t_build
+    core_rows, ext_rows = cf.metadata.num_rows, ef.metadata.num_rows
+    for h in (cf, ef, pf):                           # release the handles before the replace (Windows)
+        if hasattr(h, "close"):
+            h.close()
+    if problems:
+        for p in tmps.values():
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        return False, None, msgs + ["FAIL  %s: not published (previous lite files kept): %s" % (name, "; ".join(problems))]
+
+    # ---- publish (extension first: a core-scope refresh never reads it)
+    for part, path in (("ext", ext_path), ("core", core_path)):
+        retries = replace_with_retry(tmps[part], path)
+        if retries:
+            msgs.append("INFO  %s published after %d retry(ies) on a locked target" % (os.path.basename(path), retries))
+    if variants:
+        msgs.append("INFO  %s: %s rows with SLA_CateCode / Category in another case or with spaces (split as the trimmed "
+                    "upper-case value; copied unchanged)" % (name, format(variants, ",")))
+    info = {"rows": rows, "core_rows": core_rows, "ext_rows": ext_rows, "variants": variants,
+            "secs_build": round(t_build, 1), "secs_verify": round(t_verify, 1), "stats": stats,
+            "max_day": {c: max([abs(v) for v in day_err[c].values()] or [0.0]) for c in rc},
+            "days": len(day_err[rc[0]]) if rc else 0,
+            "gold_mb": os.path.getsize(gold_path) / 1e6,
+            "lite_mb": (os.path.getsize(core_path) + os.path.getsize(ext_path)) / 1e6}
+    return True, info, msgs
+
+
+# ----------------------------------------------------------------------------------- main
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="ALLREPO lite gold bake")
+    ap.add_argument("--full", action="store_true", help="rebuild every lite file")
+    ap.add_argument("--only", default="", help="periods to build, e.g. 2025,2026-10 (2026 = every 2026 month)")
+    ap.add_argument("--hist-dir", default=C.HIST_GOLD_DIR)
+    ap.add_argument("--current-dir", default=C.CUR_GOLD_DIR)
+    ap.add_argument("--lite-root", default=C.LITE_ROOT)
+    ap.add_argument("--ids-file", default=None, help="intra-group id CSV (default: INTRAGROUP_IDS_FILE beside the config)")
+    ap.add_argument("--round-store", choices=["double", "int64"], default=None,
+                    help="override ROUND_STORE (L6 type test; only with a --lite-root other than the config one)")
+    a = ap.parse_args(argv)
+
+    t0 = time.time()
+    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    fails, warns, infos = [], [], []
+    bad, found = check_versions()
+    print("allrepo_lite_run BUILD %s" % BUILD)
+    if bad:
+        print("FAIL  environment mismatch: %s" % "; ".join(bad))
+        return 2
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    store = a.round_store or C.ROUND_STORE
+    a.work_dir = a.lite_root
+    a.report_ok = False                              # no report into the lite root before its folder guards pass
+    a.split = {}
+    if a.ids_file is None and C.INTRAGROUP_IDS_FILE:
+        a.ids_file = os.path.join(os.path.dirname(os.path.abspath(C.__file__)), C.INTRAGROUP_IDS_FILE)
+    # ---- configuration and folder guards (before anything is written)
+    if a.round_store and norm(a.lite_root) == norm(C.LITE_ROOT):
+        fails.append("--round-store is for the L6 test only: give a scratch --lite-root as well")
+    if store not in ("double", "int64"):
+        fails.append("ROUND_STORE must be double or int64, not %r" % store)
+    if store == "int64" and any(nd > 0 for nd in C.ROUND_COLUMNS.values()):
+        fails.append("int64 store needs every ROUND_COLUMNS digit <= 0")
+    both = set(C.DROP_COLUMNS) & set(C.ROUND_COLUMNS)
+    if both:
+        fails.append("column(s) both dropped and rounded: %s" % ", ".join(sorted(both)))
+    gone = [c for c in SPLIT_COLUMNS if c in C.DROP_COLUMNS]
+    if gone:
+        fails.append("split column(s) in DROP_COLUMNS: %s" % ", ".join(gone))
+    ids, ids_padded = [], 0
+    if a.ids_file:
+        ids, ids_padded, prob = read_ids(a.ids_file)
+        fails.extend(prob)
+    ids_hash = hashlib.sha256(",".join(ids).encode()).hexdigest()[:16]
+    a.split.update(ids_listed=len(ids), ids_padded=ids_padded, ids_file=a.ids_file)
+    for d, what in ((a.hist_dir, "hist gold"), (a.current_dir, "current gold")):
+        if not os.path.isdir(d):
+            fails.append("%s folder not found: %s" % (what, d))
+        elif inside(a.lite_root, d) or inside(d, a.lite_root):
+            fails.append("lite root %s and %s folder %s overlap (Folder.Files is recursive)" % (a.lite_root, what, d))
+    if fails:
+        return finish(a, stamp, t0, found, store, None, [], [], {}, fails, warns, infos, None)
+    a.report_ok = True
+    os.makedirs(a.lite_root, exist_ok=True)
+    lock = take_lock(a.work_dir, warns)
+    if lock is None:
+        print("FAIL  another lite run holds %s" % os.path.join(a.work_dir, LOCK))
+        return 2
+    try:
+        return run(a, stamp, t0, found, store, pa, pc, pq, fails, warns, infos, ids, ids_hash)
+    finally:
+        try:
+            os.remove(lock)
+        except OSError:
+            pass
+
+
+def run(a, stamp, t0, found, store, pa, pc, pq, fails, warns, infos, ids, ids_hash):
+    fp = config_fingerprint(store, ids_hash)
+    gold = list_gold(a.hist_dir, a.current_dir)
+    hist_years = [p for s, p, _, _ in gold if s == "hist"]
+    cur_years = sorted({p[:4] for s, p, _, _ in gold if s == "current"})
+    if not hist_years:
+        fails.append("no %s*.parquet in hist gold %s" % (C.GOLD_PREFIX, a.hist_dir))
+    if not cur_years:
+        fails.append("no %s*.parquet in current gold %s" % (C.GOLD_PREFIX, a.current_dir))
+    overlap = sorted(set(hist_years) & set(cur_years))
+    if overlap:
+        fails.append("year(s) in both hist and current gold (annual roll half done?): %s" % ", ".join(overlap))
+    if not fails:
+        first_cur = [g for g in gold if g[0] == "current"][0][2]
+        ref = pq.ParquetFile(first_cur).schema_arrow
+        typo = [c for c in list(C.DROP_COLUMNS) + list(C.ROUND_COLUMNS) + list(SPLIT_COLUMNS) if c not in ref.names]
+        if typo:
+            fails.append("config names column(s) not in the gold (%s): %s" % (os.path.basename(first_cur), ", ".join(typo)))
+    if fails:
+        return finish(a, stamp, t0, found, store, fp, gold, [], {}, fails, warns, infos, None)
+
+    only = [x.strip() for x in a.only.split(",") if x.strip()]
+    selected = gold
+    if only:
+        selected = [g for g in gold if any(g[1] == o or (len(o) == 4 and g[1][:4] == o) for o in only)]
+        unknown = [o for o in only if not any(g[1] == o or (len(o) == 4 and g[1][:4] == o) for g in gold)]
+        if unknown:
+            fails.append("--only period(s) with no gold file: %s" % ", ".join(unknown))
+            return finish(a, stamp, t0, found, store, fp, gold, [], {}, fails, warns, infos, None)
+
+    staging = os.path.join(a.lite_root, STAGING)
+    if os.path.isdir(staging):
+        for n in sorted(os.listdir(staging)):
+            if n.endswith(".parquet.tmp"):
+                os.remove(os.path.join(staging, n))
+                infos.append("stray staging file from an earlier run removed: %s" % n)
+    man = load_manifest(a.work_dir)
+    if man.get("lite_root") and norm(man["lite_root"]) != norm(a.lite_root):
+        warns.append("manifest was written for lite root %s: starting a new manifest for %s"
+                     % (man["lite_root"], a.lite_root))
+        man = {"files": {}, "prescan": {}}
+    man["lite_root"] = a.lite_root
+    files = man["files"]
+
+    # ---- window (all gold files, whatever --only says)
+    dates_by, ids_found = prescan(pa, pc, pq, gold, man, ids, ids_hash)
+    save_manifest(a.work_dir, man)
+    all_dates = sorted({d for v in dates_by.values() for d in v})
+    if not all_dates:
+        fails.append("no SnapshotDate in the gold")
+        return finish(a, stamp, t0, found, store, fp, gold, [], {}, fails, warns, infos, man)
+    anchor, month_ends, window = window_dates(all_dates)
+    win_arr = pa.array(sorted(window), pa.date32())
+    ids_arr = pa.array(ids, pa.string()) if ids else None
+    a.split.update(anchor=anchor, month_ends=len(month_ends), window=len(window), dates=len(all_dates),
+                   recent_from=min(d for d in all_dates if (anchor - d).days <= C.RECENT_DAYS),
+                   ids_found=len(ids_found))
+
+    # ---- decide
+    todo = []
+    for side, period, gp, rel in selected:
+        lp, xp = os.path.join(a.lite_root, rel), os.path.join(a.lite_root, ext_rel(rel))
+        gs = stat_of(gp)
+        sig = window_sig(dates_by[gp], window)
+        e = files.get(rel)
+        reason = None
+        if a.full:
+            reason = "--full"
+        elif e is None:
+            reason = "new"
+        elif e.get("fingerprint") != fp:
+            reason = "config changed"
+        elif e.get("gold_name") != os.path.basename(gp) or e.get("gold_size") != gs["size"] \
+                or e.get("gold_mtime_ns") != gs["mtime_ns"]:
+            reason = "gold changed"
+        elif e.get("window_sig") != sig:
+            reason = "window moved"
+        elif not os.path.exists(lp) or not os.path.exists(xp):
+            reason = "lite file missing"
+        else:
+            ls, xs = stat_of(lp), stat_of(xp)
+            if ls["size"] != e.get("lite_size") or ls["mtime_ns"] != e.get("lite_mtime_ns") \
+                    or xs["size"] != e.get("ext_size") or xs["mtime_ns"] != e.get("ext_mtime_ns"):
+                reason = "lite file changed outside the job"
+        if reason:
+            todo.append((side, period, gp, rel, lp, xp, gs, sig, reason))
+    print("gold: %d hist file(s) · %d current file(s) · selected %d · to build %d · store %s · config %s · window %s"
+          % (len(hist_years), sum(1 for g in gold if g[0] == "current"), len(selected), len(todo), store, fp, anchor))
+
+    # ---- build
+    built = {}
+    for i, (side, period, gp, rel, lp, xp, gs, sig, reason) in enumerate(todo, 1):
+        print("%d/%d  %-10s %-8s (%s) ..." % (i, len(todo), side, period, reason))
+        try:
+            ok, info, msgs = bake_file(pa, pc, pq, side, gp, lp, xp, store, staging, win_arr, ids_arr)
+        except Exception as ex:                      # one bad file must not stop the others; loud, never silent
+            ok, info, msgs = False, None, ["FAIL  %s: %s: %s" % (os.path.basename(gp), type(ex).__name__, ex)]
+            for part, path in (("core", lp), ("ext", xp)):
+                tmp = os.path.join(staging, part + "_" + side + "_" + os.path.basename(path) + ".tmp")
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+        for m in msgs:
+            (fails if m.startswith("FAIL") else infos).append(m[6:])
+        if not ok:
+            print("      FAILED - see report")
+            continue
+        ls, xs = stat_of(lp), stat_of(xp)
+        files[rel] = {"gold_name": os.path.basename(gp), "gold_size": gs["size"], "gold_mtime_ns": gs["mtime_ns"],
+                      "lite_size": ls["size"], "lite_mtime_ns": ls["mtime_ns"],
+                      "ext_size": xs["size"], "ext_mtime_ns": xs["mtime_ns"], "window_sig": sig,
+                      "rows": info["rows"], "core_rows": info["core_rows"], "ext_rows": info["ext_rows"],
+                      "fingerprint": fp, "build": BUILD, "built_at": dt.datetime.now().isoformat(timespec="seconds")}
+        save_manifest(a.work_dir, man)               # commit after every file
+        if stat_of(gp) != gs:
+            warns.append("%s changed during the build: rebuilt again on the next run" % os.path.basename(gp))
+            files[rel]["gold_mtime_ns"] = -1
+            save_manifest(a.work_dir, man)
+        info["reason"] = reason
+        built[rel] = info
+        print("      %s rows = core %s + ext %s · build %.1f s · verify %.1f s · %.1f MB -> %.1f MB"
+              % (format(info["rows"], ","), format(info["core_rows"], ","), format(info["ext_rows"], ","),
+                 info["secs_build"], info["secs_verify"], info["gold_mb"], info["lite_mb"]))
+
+    # ---- orphans and stray tmp files (full scope only, after the builds)
+    removed = []
+    expected = {g[3] for g in gold} | {ext_rel(g[3]) for g in gold}
+    for side in DATA_FOLDERS:
+        d = os.path.join(a.lite_root, side)
+        if not os.path.isdir(d):
+            continue
+        for n in sorted(os.listdir(d)):
+            rel = os.path.join(side, n)
+            if n.endswith(".parquet.tmp"):
+                os.remove(os.path.join(d, n))
+                removed.append(rel + " (stray tmp)")
+            elif not only and LITE_RX.match(n) and rel not in expected:
+                if fails:
+                    warns.append("orphan %s kept: the run has a FAIL" % rel)
+                    continue
+                os.remove(os.path.join(d, n))
+                files.pop(rel, None)
+                removed.append(rel + " (gold file gone)")
+            elif not LITE_RX.match(n):
+                infos.append("not a lite file, left alone: %s" % rel)
+    if not only:
+        for rel in [r for r in files if r not in {g[3] for g in gold}]:
+            files.pop(rel, None)
+    man["fingerprint"] = fp
+    save_manifest(a.work_dir, man)
+    return finish(a, stamp, t0, found, store, fp, gold, removed, built, fails, warns, infos, man)
+
+
+# ----------------------------------------------------------------------------------- report
+def finish(a, stamp, t0, found, store, fp, gold, removed, built, fails, warns, infos, man):
+    status = "FAIL" if fails else ("WARN" if warns else "PASS")
+    s = a.split
+    L = ["ALLREPO LITE BAKE  BUILD %s  run %s  (%.0f s)  STATUS %s" % (BUILD, stamp, time.time() - t0, status),
+         "env: python %s · numpy %s · pandas %s · pyarrow %s" % (found["python"], found["numpy"], found["pandas"],
+                                                                 found["pyarrow"]),
+         "config: drop {%s} · round {%s} · store %s · fingerprint %s · %s" % (
+             ", ".join(C.DROP_COLUMNS), ", ".join("%s %d" % kv for kv in C.ROUND_COLUMNS.items()), store, fp, LOGIC_VERSION),
+         "split: core = %s (Category %s and intra-group ids: window dates only) + %s on window dates; extension = the rest"
+         % (C.REPO_SLA, "/".join(C.THIN_CATEGORIES), "/".join(C.WINDOW_SLA)),
+         "window: latest date %s · last %d days from %s · %s month-ends · %s window dates of %s" % (
+             s.get("anchor", "-"), C.RECENT_DAYS, s.get("recent_from", "-"), s.get("month_ends", "-"),
+             s.get("window", "-"), s.get("dates", "-")),
+         "intra-group ids: listed %s (%s padded to 10 digits) · found in the gold %s · file %s" % (
+             s.get("ids_listed", "-"), s.get("ids_padded", "-"), s.get("ids_found", "-"), s.get("ids_file", "-")),
+         "folders: gold hist %s · gold current %s · lite %s" % (a.hist_dir, a.current_dir, a.lite_root),
+         "Files: gold %d · built %d · removed %d%s" % (len(gold), len(built), len(removed),
+                                                      (" · --only " + a.only) if a.only else (" · --full" if a.full else ""))]
+    for rel, inf in built.items():
+        L.append("Built: %-36s %-20s %12s rows = core %12s + ext %12s · %4d dates · %7.1f MB -> %7.1f MB · build %.0f s"
+                 " · verify %.0f s · verified" % (rel, "(" + inf["reason"] + ")", format(inf["rows"], ","),
+                                                 format(inf["core_rows"], ","), format(inf["ext_rows"], ","), inf["days"],
+                                                 inf["gold_mb"], inf["lite_mb"], inf["secs_build"], inf["secs_verify"]))
+    for r in removed:
+        L.append("Removed: " + r)
+    if built:
+        L.append("Rounding (built files): column · file · sum gold EUR · sum lite EUR · diff EUR · max row EUR · "
+                 "max day diff EUR · rows to 0 · nulls")
+        for c in C.ROUND_COLUMNS:
+            for rel, inf in built.items():
+                st = inf["stats"][c]
+                L.append("  %-18s %-36s %22s %22s %16s %8s %14s %10s %10s" % (
+                    c, rel, num(st["sum_raw"]), num(st["sum_lite"]), num(st["sum_raw"] - st["sum_lite"]),
+                    num(st["max_row"]), num(inf["max_day"][c]), format(st["to_zero"], ","), format(st["nulls_raw"], ",")))
+    if man:
+        tot = {"rows": 0, "core": 0, "ext": 0}
+        per = {}
+        for rel, e in man.get("files", {}).items():
+            y = re.search(r"(\d{4})", os.path.basename(rel)).group(1)
+            p = per.setdefault(y, [0, 0])
+            p[0] += e.get("core_rows", 0)
+            p[1] += e.get("ext_rows", 0)
+            tot["rows"] += e.get("rows", 0)
+            tot["core"] += e.get("core_rows", 0)
+            tot["ext"] += e.get("ext_rows", 0)
+        L.append("Rows in the lite folders: core %s + extension %s = %s (core %.1f %%) · per year core / ext: %s" % (
+            format(tot["core"], ","), format(tot["ext"], ","), format(tot["rows"], ","),
+            100.0 * tot["core"] / max(tot["rows"], 1),
+            " · ".join("%s %s / %s" % (y, format(v[0], ","), format(v[1], ",")) for y, v in sorted(per.items()))))
+    mb = {"gold": 0.0, "core": 0.0, "ext": 0.0}
+    periods = {"hist": [], "current": []}
+    for side, period, gp, rel in gold:
+        mb["gold"] += os.path.getsize(gp) / 1e6
+        lp, xp = os.path.join(a.lite_root, rel), os.path.join(a.lite_root, ext_rel(rel))
+        if os.path.exists(lp):
+            mb["core"] += os.path.getsize(lp) / 1e6
+            periods[side].append(period)
+        if os.path.exists(xp):
+            mb["ext"] += os.path.getsize(xp) / 1e6
+    L.append("Lite folder: hist %s · current %s · core %.1f MB + extension %.1f MB on disk (gold %.1f MB)" % (
+        ",".join(periods["hist"]) or "-", (periods["current"][0] + ".." + periods["current"][-1]) if periods["current"]
+        else "-", mb["core"], mb["ext"], mb["gold"]))
+    missing = [r for _, _, _, rel in gold for r in (rel, ext_rel(rel)) if not os.path.exists(os.path.join(a.lite_root, r))]
+    if missing and not a.only and gold:
+        fails.append("lite file(s) missing after the run: " + ", ".join(missing))
+        status = "FAIL"
+        L[0] = L[0].rsplit("STATUS", 1)[0] + "STATUS FAIL"
+    for i in infos:
+        L.append("INFO  " + i)
+    for w in warns:
+        L.append("WARN  " + w)
+    for f in fails:
+        L.append("FAIL  " + f)
+    L.append("STATUS %s · built %d · removed %d · %d FAIL · %d WARN" % (status, len(built), len(removed),
+                                                                     len(fails), len(warns)))
+    text = "\n".join(L) + "\n"
+    print(text)
+    if not getattr(a, "report_ok", False):
+        print("report not written: the lite root did not pass the folder guards")
+        return {"PASS": 0, "WARN": 1, "FAIL": 2}[status]
+    try:
+        rep = os.path.join(a.work_dir, REPORTS)
+        os.makedirs(rep, exist_ok=True)
+        p = os.path.join(rep, "allrepo_lite_%s.txt" % stamp)
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        with open(os.path.join(rep, "allrepo_lite_last.txt"), "w", encoding="utf-8") as fh:
+            fh.write(text)
+        print("report: " + p)
+    except OSError as ex:
+        print("FAIL  report not written: %s" % ex)
+        return 2
+    return {"PASS": 0, "WARN": 1, "FAIL": 2}[status]
+
+
+def num(v):
+    return format(int(round(v)), ",") if abs(v) >= 1 else ("%.4f" % v)
 
 
 if __name__ == "__main__":
