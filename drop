@@ -1,0 +1,17 @@
+    AnyCols = Table.SelectRows(Table.Schema(Combined), each [Kind] = "any")[Name],
+    Result = if List.IsEmpty(AnyCols) then Combined
+        else error Error.Record("Gold contract violation", "G4 column type differs between files: " & Text.Combine(AnyCols, ", ")),
+    // DealOmegaId stays in gold (audit, Yearly/Daily dedup) but is left out of the model (VertiPaq size). BUILD 2026-11-16.
+    // Dropped after the guards so G3 still checks it in every file.
+    Model = Table.RemoveColumns(Result, {"DealOmegaId"})
+in
+    Model
+
+
+      EVALUATE
+UNION (
+    SELECTCOLUMNS ( FILTER ( INFO.VIEW.MEASURES (), CONTAINSSTRING ( [Expression], "DealOmegaId" ) ),
+        "Kind", "measure", "Name", [Name] ),
+    SELECTCOLUMNS ( FILTER ( INFO.VIEW.COLUMNS (), CONTAINSSTRING ( [Expression], "DealOmegaId" ) ),
+        "Kind", "calc column", "Name", [Name] )
+)
