@@ -1,0 +1,78 @@
+// =====================================================================================
+// P5D_CHECK.dax  -  BUILD 2026-11-14b  -  after P5D_SETUP.dax + P5D_MEASURES_TE2.csx. Read-only, 8 result tabs.
+// DAX Studio with Server Timings on: note the total of each tab (target < 2 s per tab for one CPH; whole book noted).
+// Put any CPH id in _cph (a sample client to eyeball; the page itself has no HF limit). Every tab runs for that CPH, direction 17B, Top 5 / Outstanding unless stated.
+// =====================================================================================
+DEFINE
+    VAR _cph = "replace with CPH_Id"
+    VAR _c = TREATAS ( { _cph }, DIM_COUNTERPARTY[CPH_Id] )
+
+// ---- C1 header and cards (one row), CPH then whole book. Compare with the CPH's numbers in the risk system.
+EVALUATE
+UNION (
+    ROW ( "scope", "CPH", "notional", CALCULATE ( [PD Notional], _c ), "trades", CALCULATE ( [PD Trades], _c ),
+        "hc", CALCULATE ( [PD HC], _c ), "tenor", CALCULATE ( [PD Tenor Text], _c ), "revenue", CALCULATE ( [PD Revenue], _c ),
+        "bps", CALCULATE ( [PD Rev bps], _c ), "lim_util", CALCULATE ( [PD Lim Util], _c ), "lim_pct", CALCULATE ( [PD Lim %], _c ),
+        "sponsored", CALCULATE ( [PD Sponsored Share], _c ), "subtitle", CALCULATE ( [PD Subtitle], _c ) ),
+    ROW ( "scope", "Book", "notional", [PD Notional], "trades", [PD Trades], "hc", [PD HC], "tenor", [PD Tenor Text],
+        "revenue", [PD Revenue], "bps", [PD Rev bps], "lim_util", [PD Lim Util], "lim_pct", [PD Lim %],
+        "sponsored", [PD Sponsored Share], "subtitle", [PD Subtitle] ) )
+
+// ---- C2 A1 bars by issuer type (As of and 3M ago rows) for the CPH. Shares per row must add to 100 %.
+EVALUATE
+CALCULATETABLE (
+    ADDCOLUMNS ( CROSSJOIN ( VALUES ( 'P6W R Row'[Row] ), VALUES ( 'P6W Issuer Map'[Group] ) ),
+        "face", [PD R1 Collateral] ),
+    _c, 'P6W R Compare'[Window] = "3M" )
+
+// ---- C3 A2 matrix, issuer split: types, then the EGB issuers (top 10), with shares and haircuts.
+EVALUATE
+CALCULATETABLE (
+    ADDCOLUMNS ( VALUES ( 'P6W Issuer Map'[Group] ),
+        "face", [PD A2 Face], "share", [PD A2 Share], "dpp", [PD A2 Dpp], "hc", [PD A2 HC], "hc_cmp", [PD A2 HC Cmp], "hc_d", [PD A2 HC Delta] ),
+    _c, 'P6W R Compare'[Window] = "3M" )
+EVALUATE
+FILTER (
+    CALCULATETABLE (
+        ADDCOLUMNS ( VALUES ( 'P6W Issuer Map'[IssuerName] ),
+            "face_all", [PD Face Maps], "share_of_group",
+            DIVIDE ( [PD Face Maps], CALCULATE ( [PD Face Maps], REMOVEFILTERS ( 'P6W Issuer Map'[IssuerName], 'P6W Issuer Map'[IssuerId] ) ) ) ),
+        _c, 'P6W Issuer Map'[Group] = "EGB" ),
+    NOT ISBLANK ( [face_all] ) )
+ORDER BY [face_all] DESC
+
+// ---- C4 tenor Top 5, outstanding and traded: label, % notional, % deals per slot (each column adds to ~100 %).
+EVALUATE
+ADDCOLUMNS ( VALUES ( 'PD Tenor Slot'[Order] ),
+    "out_label", CALCULATE ( [PD C Slot Label Out], _c ), "out_n", CALCULATE ( [PD C Slot N Out], _c ), "out_k", CALCULATE ( [PD C Slot K Out], _c ),
+    "trd_label", CALCULATE ( [PD C Slot Label Trd], _c ), "trd_n", CALCULATE ( [PD C Slot N Trd], _c ), "trd_k", CALCULATE ( [PD C Slot K Trd], _c ) )
+ORDER BY 'PD Tenor Slot'[Order]
+
+// ---- C5 tenor ladder, outstanding, with the tooltip text (average tenor inside each bucket).
+EVALUATE
+ADDCOLUMNS ( VALUES ( 'PD Tenor Ladder'[Order] ),
+    "range", CALCULATE ( MAX ( 'PD Tenor Ladder'[Range] ) ),
+    "n", CALCULATE ( [PD C Lad N Out], _c ), "k", CALCULATE ( [PD C Lad K Out], _c ), "tip", CALCULATE ( [PD C Lad Tip Out], _c ) )
+ORDER BY 'PD Tenor Ladder'[Order]
+
+// ---- C6 accounts D (CPH): per account type and the top CPYs.
+EVALUATE
+CALCULATETABLE (
+    FILTER (
+        ADDCOLUMNS ( SUMMARIZE ( DIM_COUNTERPARTY, DIM_COUNTERPARTY[Account Type], DIM_COUNTERPARTY[CPY Label] ),
+            "notional", [PD Notional], "hc", [PD HC], "tenor", [PD Tenor Text], "revenue", [PD Revenue] ),
+        [notional] > 0 ),
+    _c )
+ORDER BY DIM_COUNTERPARTY[Account Type], [notional] DESC
+
+// ---- C7 maturity wall E (CPH) and watch points F (CPH).
+EVALUATE
+ADDCOLUMNS ( VALUES ( 'PD Maturity Bucket'[Order] ),
+    "bucket", CALCULATE ( MAX ( 'PD Maturity Bucket'[Bucket] ) ),
+    "notional", CALCULATE ( [PD E Notional], _c ), "share", CALCULATE ( [PD E Share], _c ), "cum", CALCULATE ( [PD E Cum], _c ) )
+ORDER BY 'PD Maturity Bucket'[Order]
+EVALUATE
+ADDCOLUMNS ( SUMMARIZE ( 'PD F Row', 'PD F Row'[Order], 'PD F Row'[Point] ),
+    "now", CALCULATE ( [PD F Now Text], _c ), "cmp", CALCULATE ( [PD F Cmp Text], _c ),
+    "threshold", [PD F Threshold Text], "hit", CALCULATE ( [PD F Hit], _c ) )
+ORDER BY 'PD F Row'[Order]
