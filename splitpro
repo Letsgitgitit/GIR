@@ -33,3 +33,58 @@ def main():
     for i, (side, period, gp, rel) in enumerate(gold, 1):
         pf = pq.ParquetFile(gp)
         for b in pf.iter_batches(batch_size=1_048_576, columns=["SnapshotDate", "SLA_CateCode", "Category"]):
+            d = R.to_date32(pa, pc, b.column(0))
+            sla = pc.cast(b.column(1), pa.string())
+            cat = pc.cast(b.column(2), pa.string())
+            t = pa.table({"d": d, "s": sla, "c": cat})
+            for s, n in zip(*[x.to_pylist() for x in pc.value_counts(sla).flatten()]):
+                spell[(period, s)] += n
+            norm_s = pc.utf8_upper(pc.utf8_trim_whitespace(sla))
+            norm_c = pc.utf8_upper(pc.utf8_trim_whitespace(cat))
+            odd_c = pc.and_(pc.fill_null(pc.equal(norm_c, "FCG21"), False), pc.fill_null(pc.not_equal(cat, "FCG21"), False))
+            for v, n in zip(*[x.to_pylist() for x in pc.value_counts(pc.filter(cat, odd_c)).flatten()]):
+                cat_var[(period, v)] += n
+            is07 = pc.fill_null(pc.equal(norm_s, "07L"), False)
+            g = pa.table({"d": pc.filter(d, is07)}).group_by("d").aggregate([("d", "count")])
+            for dd, n in zip(g.column("d").to_pylist(), g.column("d_count").to_pylist()):
+                gold_07l[dd] += n
+            odd = pc.and_(is07, pc.fill_null(pc.not_equal(sla, "07L"), False))
+            if pc.any(odd).as_py():
+                g2 = pa.table({"d": pc.filter(d, odd), "s": pc.filter(sla, odd)}).group_by(["d", "s"]).aggregate([("d", "count")])
+                for dd, s, n in zip(*[g2.column(x).to_pylist() for x in ("d", "s", "d_count")]):
+                    odd_by_date[dd][repr(s)] += n
+        print("%d/%d %s  %.0f s" % (i, len(gold), os.path.basename(gp), time.time() - t0))
+    core_07l = collections.Counter()
+    for side, period, gp, rel in gold:
+        lp = os.path.join(C.LITE_ROOT, rel)
+        if not os.path.exists(lp):
+            print("core file missing: %s" % lp)
+            continue
+        for b in pq.ParquetFile(lp).iter_batches(batch_size=1_048_576, columns=["SnapshotDate", "SLA_CateCode"]):
+            d = R.to_date32(pa, pc, b.column(0))
+            is07 = pc.fill_null(pc.equal(pc.utf8_upper(pc.utf8_trim_whitespace(pc.cast(b.column(1), pa.string()))), "07L"), False)
+            g = pa.table({"d": pc.filter(d, is07)}).group_by("d").aggregate([("d", "count")])
+            for dd, n in zip(g.column("d").to_pylist(), g.column("d_count").to_pylist()):
+                core_07l[dd] += n
+
+    print("\nA. SLA_CateCode spellings per gold file (repr, rows)")
+    for (period, s), n in sorted(spell.items(), key=lambda kv: (kv[0][0], str(kv[0][1]))):
+        print("   %-8s %-12r %12s" % (period, s, format(n, ",")))
+    print("\nB. Category spellings equal to FCG21 apart from case / spaces (repr, rows): %s" % (
+        "none" if not cat_var else ""))
+    for (period, v), n in sorted(cat_var.items()):
+        print("   %-8s %-12r %12s" % (period, v, format(n, ",")))
+    missing = sorted(d for d in gold_07l if core_07l.get(d, 0) == 0)
+    print("\nC. dates with 07L rows in the gold and NONE in the core files: %d" % len(missing))
+    for d in missing:
+        print("   %s  gold 07L rows %s  spellings %s" % (d, format(gold_07l[d], ","), dict(odd_by_date.get(d, {})) or "-"))
+    part = sorted(d for d in gold_07l if 0 < core_07l.get(d, 0) and d in odd_by_date)
+    print("\nD. dates with some 07L rows in another spelling (core holds part of them): %d" % len(part))
+    for d in part[:40]:
+        print("   %s  %s" % (d, dict(odd_by_date[d])))
+    print("\ndone in %.0f s" % (time.time() - t0))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
