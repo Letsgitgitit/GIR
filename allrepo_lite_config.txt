@@ -1,6 +1,8 @@
 # =====================================================================================
-# allrepo_lite_config.py  -  BUILD 2026-11-16d
-# ALLREPO lite gold: every setting of the lite bake in one place
+# allrepo_lite_config.py  -  BUILD 2026-11-16f
+# ALLREPO lite gold: every setting of the lite bake in one place (/merge/ALLREPO_LITE_HANDOFF.md,
+# /lite/ALLREPO_LITE_STATUS.md "LITE CONFIG v1").
+#
 # The lite bake READS the full gold and WRITES a second, separate set of files. The full gold and its job are never
 # changed. Re-include a column = remove it from DROP_COLUMNS (or a rounding = remove it from ROUND_COLUMNS), run
 # allrepo_lite_run.py, refresh. Any change below changes the config fingerprint, so the next run rebuilds every file by
@@ -21,7 +23,7 @@ LITE_ROOT = r"G:\_CCC_Data\repo\ALLREPO\Historical - Parquet\ALLREPO_lite"
 GOLD_PREFIX = "FACT_ALLREPO_gold_"     # gold hist FACT_ALLREPO_gold_YYYY.parquet, current FACT_ALLREPO_gold_YYYY-MM.parquet
 LITE_PREFIX = "FACT_ALLREPO_lite_"     # lite hist FACT_ALLREPO_lite_YYYY.parquet, current FACT_ALLREPO_lite_YYYY-MM.parquet
 
-# ---- LITE CONFIG v1.1 (Will, 16 Nov 2026) --------------------------------------------------------
+# ---- LITE CONFIG v1.2 (Will, 16 Nov 2026) --------------------------------------------------------
 # Columns left out of the lite files. Every other gold column is copied unchanged.
 DROP_COLUMNS = [
     "AmountBuy",            # original currency (AmountBuy_EUR stays)
@@ -44,6 +46,8 @@ ROUND_COLUMNS = {
     "NotionalBond_EUR": -3,
     "MTMSecurity_EUR": -3,
     "MTMCash_EUR": -3,
+    "AmountBuy_EUR": -3,    # v1.2 (Will, 16 Nov 17:15): no measure reads it; HASH 479 MB in the model before rounding
+    "AmountSell_EUR": -3,   # v1.2: idem, 500 MB
 }
 
 # How the rounded columns are stored: "double" (Decimal number in Power BI, as today) or "int64" (Whole number).
@@ -58,3 +62,22 @@ SOURCE_FILE_COLUMN = "_SourceFile"
 
 # Rows per row group in the lite files (Power BI reads Parquet row group by row group).
 ROW_GROUP_ROWS = 1_048_576
+
+# ---- CORE / EXTENSION split (LITE CONFIG v1.3, Will, 16 Nov 2026 22:07) --------------------------------------------
+# Every gold row goes to exactly one part. CORE = hist\ + current\ (loaded by default). EXTENSION = ext_hist\ +
+# ext_current\ (loaded only when the Power Query parameter ALLREPO_SCOPE = "full"; same table, same measures).
+# "Window dates" = the last file date of each calendar month (month-ends) + the file dates of the last RECENT_DAYS days.
+# A row is CORE when:
+#   SLA_CateCode = REPO_SLA, except Category in THIN_CATEGORIES or HeadOfficeSirisId in the intra-group id file:
+#       those repo rows are core on window dates only;
+#   or SLA_CateCode in WINDOW_SLA and the date is a window date.
+# Everything else (07F, 07Y, 07M, 10C, ...; and the thinned rows outside the window) goes to the EXTENSION.
+# No measure reads a non-07L row today (16 Nov SX3): the default load changes no page figure.
+REPO_SLA = "07L"
+WINDOW_SLA = ["07K"]             # securities lending
+THIN_CATEGORIES = ["FCG21"]      # CCPs / central securities depositories
+RECENT_DAYS = 90
+# Intra-group ids: an ids-only CSV beside this file, exported from the model (DIM_COUNTERPARTY[IsIntraGroup] = TRUE,
+# group-managed funds included). Runsheet step 3a. Leading zeros lost in Excel are put back (10-digit ids).
+# An entity flagged later stays fully in core until the file is exported again (more data, never less).
+INTRAGROUP_IDS_FILE = "allrepo_lite_intragroup_ids.csv"
