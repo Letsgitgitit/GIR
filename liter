@@ -1,0 +1,141 @@
+// =====================================================================================
+// ALLREPO_LITER_CHECK.dax  -  BUILD 2026-11-17a  -  read-only
+// Model-side check of the core / extension split (LITE CONFIG v1.3). Run the SAME file in both .pbix and put the
+// results side by side:
+//   LITE  = the .pbix on the first rebake (v1.2: every row, rounded)        -> the reference
+//   LITER = the .pbix on the split bake, ALLREPO_SCOPE = core                -> under test
+// The bake has already compared every lite file with its gold file value by value; this checks that the model holds
+// exactly the core rows, replaying the split rule IN DAX (independent of the Python code).
+//
+// SET FIRST (same values in both runs):
+//   _anchor = LITER's latest date (bake report line "window: latest date ...")
+//   _cut    = the last date BOTH .pbix hold (LC0 shows each one's latest date) - everything is compared up to it
+//   _old    = an ordinary date older than 90 days and not a month-end (e.g. a mid-January 2025 file date)
+//   _kw     = the CPG keywords excluded from intra-group (copy from ALLREPO_LITE_IDS_EXPORT.dax)
+//
+// EXPECTED
+//   LC0  both: latest date and row counts (LITER rows = bake report core total if _cut = latest)
+//   LC1  rows and sums per year x SLA code: LITER 07F / 07Y / 07M / 10C = 0; 07L and 07K lower than LITE (thinned rows)
+//   LC2  per year: LITE "CoreByRule" = LITER "AllRows" exactly · LITER "ExtByRule" = 0 (nothing loaded that the rule
+//        puts in the extension) · LITE "ExtByRule" = rows of LC1 that LITER lacks
+//   LC3  three dates, per SLA code, thinned (CCP / intra-group) vs other clients:
+//        latest date and last month-end: 07L and 07K identical in both (rows and RiskNet); other codes 0 in LITER
+//        old date: 07L "other clients" identical; 07L "thinned" and 07K = 0 in LITER
+//   Then run the page checks in both (PX_CHECK.dax, P5D_CHECK.dax, P6a K4 / R1c at 4 Nov): identical (all in window).
+// =====================================================================================
+
+DEFINE
+    VAR _anchor = DATE ( 2026, 11, 16 )
+    VAR _cut = DATE ( 2026, 11, 16 )
+    VAR _old = DATE ( 2025, 1, 15 )
+    VAR _kw = { "replace with CPG name keyword 1", "replace with CPG name keyword 2" }
+
+    VAR _days = CALCULATETABLE ( VALUES ( FACT_ALLREPO[SnapshotDate] ), REMOVEFILTERS (), FACT_ALLREPO[SnapshotDate] <= _cut )
+    VAR _ym = ADDCOLUMNS ( _days, "@ym", YEAR ( FACT_ALLREPO[SnapshotDate] ) * 100 + MONTH ( FACT_ALLREPO[SnapshotDate] ) )
+    VAR _me = GROUPBY ( _ym, [@ym], "@d", MAXX ( CURRENTGROUP (), FACT_ALLREPO[SnapshotDate] ) )
+    VAR _win =
+        DISTINCT (
+            UNION (
+                SELECTCOLUMNS ( _me, "d", [@d] ),
+                SELECTCOLUMNS ( FILTER ( _days, _anchor - FACT_ALLREPO[SnapshotDate] <= 90 ), "d", FACT_ALLREPO[SnapshotDate] )
+            )
+        )
+    VAR _igAll =
+        ADDCOLUMNS (
+            CALCULATETABLE ( VALUES ( DIM_COUNTERPARTY[HeadOfficeSirisId] ), REMOVEFILTERS (), DIM_COUNTERPARTY[IsIntraGroup] = TRUE () ),
+            "@cpg", UPPER ( CALCULATE ( MAX ( DIM_COUNTERPARTY[CPG_Name_Final] ) ) )
+        )
+    VAR _ig = SELECTCOLUMNS ( FILTER ( _igAll, ISEMPTY ( FILTER ( _kw, CONTAINSSTRING ( [@cpg], UPPER ( [Value] ) ) ) ) ),
+        "id", DIM_COUNTERPARTY[HeadOfficeSirisId] )
+    VAR _thin =
+        FILTER (
+            CALCULATETABLE ( SUMMARIZE ( FACT_ALLREPO, FACT_ALLREPO[Category], FACT_ALLREPO[HeadOfficeSirisId] ), REMOVEFILTERS () ),
+            FACT_ALLREPO[Category] = "FCG21" || FACT_ALLREPO[HeadOfficeSirisId] IN _ig
+        )
+    VAR _years = DISTINCT ( SELECTCOLUMNS ( _days, "Year", YEAR ( FACT_ALLREPO[SnapshotDate] ) ) )
+
+// ---- LC0 what this .pbix holds ----------------------------------------------------------------------
+EVALUATE
+ROW (
+    "LatestDate", CALCULATE ( MAX ( FACT_ALLREPO[SnapshotDate] ), REMOVEFILTERS () ),
+    "Rows", CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS () ),
+    "RowsUpToCut", CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (), FACT_ALLREPO[SnapshotDate] <= _cut ),
+    "DatesUpToCut", COUNTROWS ( _days ),
+    "WindowDates", COUNTROWS ( _win ),
+    "IntraGroupIds", COUNTROWS ( _ig ),
+    "Scope", IF ( ISEMPTY ( CALCULATETABLE ( FACT_ALLREPO, REMOVEFILTERS (), FACT_ALLREPO[SLA_CateCode] = "07F" ) ),
+        "no 07F loaded (core?)", "07F loaded (full / v1.2)" )
+)
+
+// ---- LC1 rows and sums per year x SLA code ----------------------------------------------------------
+EVALUATE
+VAR _g = GENERATE ( _years, CALCULATETABLE ( VALUES ( FACT_ALLREPO[SLA_CateCode] ), REMOVEFILTERS () ) )
+RETURN
+    ADDCOLUMNS (
+        _g,
+        "Rows", VAR _y = [Year] VAR _s = FACT_ALLREPO[SLA_CateCode] RETURN
+            CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (), YEAR ( FACT_ALLREPO[SnapshotDate] ) = _y,
+                FACT_ALLREPO[SnapshotDate] <= _cut, FACT_ALLREPO[SLA_CateCode] = _s ) + 0,
+        "RiskNet", VAR _y = [Year] VAR _s = FACT_ALLREPO[SLA_CateCode] RETURN
+            CALCULATE ( SUM ( FACT_ALLREPO[RiskNet_EUR] ), REMOVEFILTERS (), YEAR ( FACT_ALLREPO[SnapshotDate] ) = _y,
+                FACT_ALLREPO[SnapshotDate] <= _cut, FACT_ALLREPO[SLA_CateCode] = _s ) + 0,
+        "CashAmount", VAR _y = [Year] VAR _s = FACT_ALLREPO[SLA_CateCode] RETURN
+            CALCULATE ( SUM ( FACT_ALLREPO[CashAmount_EUR] ), REMOVEFILTERS (), YEAR ( FACT_ALLREPO[SnapshotDate] ) = _y,
+                FACT_ALLREPO[SnapshotDate] <= _cut, FACT_ALLREPO[SLA_CateCode] = _s ) + 0,
+        "NotionalBond", VAR _y = [Year] VAR _s = FACT_ALLREPO[SLA_CateCode] RETURN
+            CALCULATE ( SUM ( FACT_ALLREPO[NotionalBond_EUR] ), REMOVEFILTERS (), YEAR ( FACT_ALLREPO[SnapshotDate] ) = _y,
+                FACT_ALLREPO[SnapshotDate] <= _cut, FACT_ALLREPO[SLA_CateCode] = _s ) + 0
+    )
+ORDER BY [Year], [SLA_CateCode]
+
+// ---- LC2 the split rule replayed per year -----------------------------------------------------------
+EVALUATE
+VAR _t =
+    ADDCOLUMNS (
+        _years,
+        "AllRows", VAR _y = [Year] RETURN CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (),
+            YEAR ( FACT_ALLREPO[SnapshotDate] ) = _y, FACT_ALLREPO[SnapshotDate] <= _cut ) + 0,
+        "@L", VAR _y = [Year] RETURN CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (),
+            YEAR ( FACT_ALLREPO[SnapshotDate] ) = _y, FACT_ALLREPO[SnapshotDate] <= _cut, FACT_ALLREPO[SLA_CateCode] = "07L" ) + 0,
+        "@Lthin", VAR _y = [Year] RETURN CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (),
+            YEAR ( FACT_ALLREPO[SnapshotDate] ) = _y, FACT_ALLREPO[SnapshotDate] <= _cut, FACT_ALLREPO[SLA_CateCode] = "07L", _thin ) + 0,
+        "@LthinWin", VAR _y = [Year] RETURN CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (),
+            YEAR ( FACT_ALLREPO[SnapshotDate] ) = _y, FACT_ALLREPO[SnapshotDate] <= _cut, FACT_ALLREPO[SLA_CateCode] = "07L", _thin,
+            TREATAS ( _win, FACT_ALLREPO[SnapshotDate] ) ) + 0,
+        "@KWin", VAR _y = [Year] RETURN CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (),
+            YEAR ( FACT_ALLREPO[SnapshotDate] ) = _y, FACT_ALLREPO[SnapshotDate] <= _cut, FACT_ALLREPO[SLA_CateCode] = "07K",
+            TREATAS ( _win, FACT_ALLREPO[SnapshotDate] ) ) + 0
+    )
+RETURN
+    SELECTCOLUMNS (
+        _t,
+        "Year", [Year],
+        "AllRows", [AllRows],
+        "CoreByRule", [@L] - [@Lthin] + [@LthinWin] + [@KWin],
+        "ExtByRule", [AllRows] - ( [@L] - [@Lthin] + [@LthinWin] + [@KWin] ),
+        "Repo07L", [@L],
+        "Repo07L_Thinned", [@Lthin],
+        "Repo07L_ThinnedOnWindow", [@LthinWin],
+        "SecLending07K_OnWindow", [@KWin]
+    )
+ORDER BY [Year]
+
+// ---- LC3 three dates: latest, last month-end, an old ordinary date ----------------------------------
+EVALUATE
+VAR _lastME = MAXX ( FILTER ( _me, [@d] < DATE ( YEAR ( _cut ), MONTH ( _cut ), 1 ) ), [@d] )
+VAR _dates = { ( "1 latest", _cut ), ( "2 last month-end", _lastME ), ( "3 old date", _old ) }
+VAR _g = GENERATE ( _dates, CALCULATETABLE ( VALUES ( FACT_ALLREPO[SLA_CateCode] ), REMOVEFILTERS () ) )
+RETURN
+    ADDCOLUMNS (
+        _g,
+        "RowsThinned", VAR _d = [Value2] VAR _s = FACT_ALLREPO[SLA_CateCode] RETURN
+            CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (), FACT_ALLREPO[SnapshotDate] = _d, FACT_ALLREPO[SLA_CateCode] = _s, _thin ) + 0,
+        "RowsOther", VAR _d = [Value2] VAR _s = FACT_ALLREPO[SLA_CateCode] RETURN
+            CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (), FACT_ALLREPO[SnapshotDate] = _d, FACT_ALLREPO[SLA_CateCode] = _s ) + 0
+            - CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (), FACT_ALLREPO[SnapshotDate] = _d, FACT_ALLREPO[SLA_CateCode] = _s, _thin ) + 0,
+        "RiskNetThinned", VAR _d = [Value2] VAR _s = FACT_ALLREPO[SLA_CateCode] RETURN
+            CALCULATE ( SUM ( FACT_ALLREPO[RiskNet_EUR] ), REMOVEFILTERS (), FACT_ALLREPO[SnapshotDate] = _d, FACT_ALLREPO[SLA_CateCode] = _s, _thin ) + 0,
+        "RiskNetAll", VAR _d = [Value2] VAR _s = FACT_ALLREPO[SLA_CateCode] RETURN
+            CALCULATE ( SUM ( FACT_ALLREPO[RiskNet_EUR] ), REMOVEFILTERS (), FACT_ALLREPO[SnapshotDate] = _d, FACT_ALLREPO[SLA_CateCode] = _s ) + 0
+    )
+ORDER BY [Value1], [SLA_CateCode]
