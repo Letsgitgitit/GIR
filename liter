@@ -1,5 +1,5 @@
 // =====================================================================================
-// ALLREPO_LITER_CHECK.dax  -  BUILD 2026-11-17a  -  read-only
+// ALLREPO_LITER_CHECK.dax  -  BUILD 2026-11-17b  -  read-only
 // Model-side check of the core / extension split (LITE CONFIG v1.3). Run the SAME file in both .pbix and put the
 // results side by side:
 //   LITE  = the .pbix on the first rebake (v1.2: every row, rounded)        -> the reference
@@ -11,7 +11,9 @@
 //   _anchor = LITER's latest date (bake report line "window: latest date ...")
 //   _cut    = the last date BOTH .pbix hold (LC0 shows each one's latest date) - everything is compared up to it
 //   _old    = an ordinary date older than 90 days and not a month-end (e.g. a mid-January 2025 file date)
-//   _kw     = the CPG keywords excluded from intra-group (copy from ALLREPO_LITE_IDS_EXPORT.dax)
+//   _kw     = CPG keywords excluded from intra-group (leave the placeholders if none were used)
+//   _drop   = the HeadOfficeSirisIds deleted by hand from the exported CSV (10 digits, as text) - so the DAX list equals
+//             the CSV the bake read. LC0 "IntraGroupIds" must equal the bake report "intra-group ids: listed N".
 //
 // EXPECTED
 //   LC0  both: latest date and row counts (LITER rows = bake report core total if _cut = latest)
@@ -29,6 +31,7 @@ DEFINE
     VAR _cut = DATE ( 2026, 11, 16 )
     VAR _old = DATE ( 2025, 1, 15 )
     VAR _kw = { "replace with CPG name keyword 1", "replace with CPG name keyword 2" }
+    VAR _drop = { "0000000000" }                 // <- ids deleted from the CSV by hand; "0000000000" = placeholder
 
     VAR _days = CALCULATETABLE ( VALUES ( FACT_ALLREPO[SnapshotDate] ), REMOVEFILTERS (), FACT_ALLREPO[SnapshotDate] <= _cut )
     VAR _ym = ADDCOLUMNS ( _days, "@ym", YEAR ( FACT_ALLREPO[SnapshotDate] ) * 100 + MONTH ( FACT_ALLREPO[SnapshotDate] ) )
@@ -45,7 +48,8 @@ DEFINE
             CALCULATETABLE ( VALUES ( DIM_COUNTERPARTY[HeadOfficeSirisId] ), REMOVEFILTERS (), DIM_COUNTERPARTY[IsIntraGroup] = TRUE () ),
             "@cpg", UPPER ( CALCULATE ( MAX ( DIM_COUNTERPARTY[CPG_Name_Final] ) ) )
         )
-    VAR _ig = SELECTCOLUMNS ( FILTER ( _igAll, ISEMPTY ( FILTER ( _kw, CONTAINSSTRING ( [@cpg], UPPER ( [Value] ) ) ) ) ),
+    VAR _ig = SELECTCOLUMNS ( FILTER ( _igAll, ISEMPTY ( FILTER ( _kw, CONTAINSSTRING ( [@cpg], UPPER ( [Value] ) ) ) )
+            && NOT ( DIM_COUNTERPARTY[HeadOfficeSirisId] IN _drop ) ),
         "id", DIM_COUNTERPARTY[HeadOfficeSirisId] )
     VAR _thin =
         FILTER (
