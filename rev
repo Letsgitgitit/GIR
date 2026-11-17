@@ -1,0 +1,52 @@
+// =====================================================================================
+// ALLREPO_LITE_IDS_REVIEW.dax  -  BUILD 2026-11-17a  -  read-only, results to the grid (not to a file)
+// Before exporting the intra-group ids (ALLREPO_LITE_IDS_EXPORT.dax): which CPGs the IsIntraGroup flag holds, how many
+// ALLREPO rows each carries, and which ones the exclusion keywords take out.
+// _kw = CPG name keywords to EXCLUDE from the intra-group thinning (case-insensitive, "contains"). Type the real names at
+// work; keep the SAME list in ALLREPO_LITE_IDS_EXPORT.dax. An excluded CPY is treated like any client: its repo rows stay
+// in core on every date (its other risk codes follow the normal rule).
+//   IR1 per CPG_Name_Final: flagged entities, ALLREPO rows, of which 07L (what the thinning acts on), excluded?
+//   IR2 per entity: id, label, CPG, MCG, rows, 07L rows, excluded?  (check the keywords catch what you mean)
+// =====================================================================================
+
+DEFINE
+    VAR _kw = { "replace with CPG name keyword 1", "replace with CPG name keyword 2" }
+
+// ---- IR1 per CPG ------------------------------------------------------------------------------------
+EVALUATE
+VAR _cpg = CALCULATETABLE ( VALUES ( DIM_COUNTERPARTY[CPG_Name_Final] ), REMOVEFILTERS (), DIM_COUNTERPARTY[IsIntraGroup] = TRUE () )
+VAR _t =
+    ADDCOLUMNS (
+        _cpg,
+        "Entities", CALCULATE ( COUNTROWS ( DIM_COUNTERPARTY ), DIM_COUNTERPARTY[IsIntraGroup] = TRUE () ),
+        "Rows",
+            VAR _ids = CALCULATETABLE ( VALUES ( DIM_COUNTERPARTY[HeadOfficeSirisId] ), DIM_COUNTERPARTY[IsIntraGroup] = TRUE () )
+            RETURN CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (), TREATAS ( _ids, FACT_ALLREPO[HeadOfficeSirisId] ) ) + 0,
+        "Rows07L",
+            VAR _ids = CALCULATETABLE ( VALUES ( DIM_COUNTERPARTY[HeadOfficeSirisId] ), DIM_COUNTERPARTY[IsIntraGroup] = TRUE () )
+            RETURN CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (), TREATAS ( _ids, FACT_ALLREPO[HeadOfficeSirisId] ),
+                FACT_ALLREPO[SLA_CateCode] = "07L" ) + 0,
+        "Excluded",
+            VAR _n = UPPER ( DIM_COUNTERPARTY[CPG_Name_Final] )
+            RETURN NOT ISEMPTY ( FILTER ( _kw, CONTAINSSTRING ( _n, UPPER ( [Value] ) ) ) )
+    )
+RETURN
+    SELECTCOLUMNS ( _t, "CPG_Name_Final", DIM_COUNTERPARTY[CPG_Name_Final], "Entities", [Entities], "Rows", [Rows],
+        "Rows07L", [Rows07L], "Excluded", [Excluded] )
+ORDER BY [Rows] DESC
+
+// ---- IR2 per entity ---------------------------------------------------------------------------------
+EVALUATE
+VAR _e = CALCULATETABLE ( VALUES ( DIM_COUNTERPARTY[HeadOfficeSirisId] ), REMOVEFILTERS (), DIM_COUNTERPARTY[IsIntraGroup] = TRUE () )
+RETURN
+    ADDCOLUMNS (
+        _e,
+        "Label", CALCULATE ( MAX ( DIM_COUNTERPARTY[CPY Label] ) ),
+        "CPG_Name_Final", CALCULATE ( MAX ( DIM_COUNTERPARTY[CPG_Name_Final] ) ),
+        "MCG_Code", CALCULATE ( MAX ( DIM_COUNTERPARTY[MCG_Code] ) ),
+        "Rows", VAR _i = DIM_COUNTERPARTY[HeadOfficeSirisId] RETURN CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (), FACT_ALLREPO[HeadOfficeSirisId] = _i ) + 0,
+        "Rows07L", VAR _i = DIM_COUNTERPARTY[HeadOfficeSirisId] RETURN CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (), FACT_ALLREPO[HeadOfficeSirisId] = _i, FACT_ALLREPO[SLA_CateCode] = "07L" ) + 0,
+        "Excluded", VAR _n = UPPER ( CALCULATE ( MAX ( DIM_COUNTERPARTY[CPG_Name_Final] ) ) )
+            RETURN NOT ISEMPTY ( FILTER ( _kw, CONTAINSSTRING ( _n, UPPER ( [Value] ) ) ) )
+    )
+ORDER BY [Rows] DESC
