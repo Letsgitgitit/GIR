@@ -1,49 +1,59 @@
-// ALLREPO_LITE_M.m - FACT_ALLREPO on the LITE gold folders. BUILD 2026-11-16d. Runsheet: /lite/ALLREPO_LITE_RUNSHEET.md.
-// Checked against the live FACT_ALLREPO text of 16 Nov 2026 (BUILD 2026-10-16a; Base = 76 of the 82 gold columns, no step
-// after the combine). The live Base list is now applied in the bake instead: the lite files carry those 76 columns minus
-// AmountBuy / AmountSell (LITE CONFIG v1.1), + _SourceFile = 75 columns. (The live "Dropped:" comment is stale: it names
-// MTMSecurity_EUR, MTMCash_EUR, RiskBrut_EUR, which ARE in its Base list since 12 Nov.)
+// ALLREPO_LITE_M.m - FACT_ALLREPO on the LITE gold folders, core / extension. BUILD 2026-11-16f.
+// Runsheet: /lite/ALLREPO_LITE_RUNSHEET.md. Three blocks:
+//   P  parameter ALLREPO_SCOPE (create it first: Home > Manage Parameters > New)
+//   A  FACT_ALLREPO (replaces the live query; for the pilot: a new query FACT_ALLREPO_LITE_TEST with PilotYears set)
+//   B  ALLREPO_SCOPE_INFO (new small query, loaded: one row for a page label "what ALLREPO holds")
 //
-// Same guards as the live merged query (ALLREPO_MERGE_M.m), on the lite folders, all FAIL the refresh:
-//   G1 each folder has at least one FACT_ALLREPO_lite_*.parquet (top level only; the job files _staging / _reports sit beside them);
-//   G2 no year in both folders (protects the annual roll);
-//   G3 per file, before Table.Combine: the critical columns present AND the file's column set = the first current file's
-//      column set (Sales merge pattern). Re-including a column in the lite config therefore needs NO edit here, and a
-//      file that drifted still fails instead of being null-filled by the combine;
+// Checked against the live FACT_ALLREPO text of 16 Nov 2026 (BUILD 2026-10-16a; Base = 76 of the 82 gold columns, no step
+// after the combine). The column choice now happens in the bake (LITE CONFIG v1.3): 75 columns incl. _SourceFile.
+// Same guards as the live merged query, all FAIL the refresh:
+//   G1 each folder read has at least one FACT_ALLREPO_lite_*.parquet (top level only: _staging / _reports sit beside them);
+//   G2 no year on both the hist side and the current side (protects the annual roll), core and extension together;
+//   G3 per file, before Table.Combine: the critical columns present AND the file's column set = the first current core
+//      file's column set (Sales merge pattern). Re-including a column in the lite config needs NO edit here;
 //   G4 no column of type any after the combine.
-// Differences from the live query, all intended:
-//   - folders and file prefix (lite); hist files already carry _SourceFile (= the gold yearly file name, the value the
-//     live query added per row), so there is no per-row step;
-//   - the column list is no longer typed out here: it is the lite files' own column set (allrepo_lite_config.py);
-//   - PilotYears: {} = every file (production). For the L7 pilot query FACT_ALLREPO_LITE_TEST: {"2025", "2026"}.
+// Scope: "core" (default) reads hist\ + current\; "full" adds ext_hist\ + ext_current\ to the SAME table (same measures,
+// relationships, pages). Switch: change the parameter, refresh (full ≈ 22 min). Rows in each part: bake report.
 // Rollback: paste the saved live text back into FACT_ALLREPO and refresh (the full gold is never changed).
 
+// ===================================================================== P: parameter ALLREPO_SCOPE
+// Home > Manage Parameters > New Parameter: Name ALLREPO_SCOPE · Required ticked · Type Text ·
+// Suggested values: List of values: core, full · Current value: core. (Its Advanced Editor text reads like this:)
+"core" meta [IsParameterQuery = true, List = {"core", "full"}, DefaultValue = "core", Type = "Text", IsParameterQueryRequired = true]
+
+// ===================================================================== A: FACT_ALLREPO
 let
     LiteRoot = "G:\_CCC_Data\repo\ALLREPO\Historical - Parquet\ALLREPO_lite",
-    HistFolder = LiteRoot & "\hist",
-    CurFolder = LiteRoot & "\current",
+    Scope = if ALLREPO_SCOPE = "full" then "full" else if ALLREPO_SCOPE = "core" then "core"
+        else error Error.Record("Gold contract violation", "ALLREPO_SCOPE must be core or full, not " & ALLREPO_SCOPE),
     Prefix = "FACT_ALLREPO_lite_",
     PilotYears = {},
-    Critical = {"SnapshotDate", "HeadOfficeSirisId", "BuySell", "SLA_CateCode", "InstLabel", "CCCTradeKey",
+    Critical = {"SnapshotDate", "HeadOfficeSirisId", "BuySell", "SLA_CateCode", "Category", "InstLabel", "CCCTradeKey",
                 "TradeDate", "StartDate", "MaturityDate", "IssuerId", "Rating_ssj", "Haircut", "RiskNet_EUR",
                 "RiskBrut_EUR", "NotionalBond_EUR", "CashAmount_EUR", "MTMSecurity_EUR", "MTMCash_EUR", "_SourceFile"},
     ListFiles = (folder as text, side as text) =>
         let
-            src = Folder.Files(folder),
+            path = LiteRoot & "\" & folder,
+            src = Folder.Files(path),
             f = Table.SelectRows(src, each Text.Lower([Extension]) = ".parquet"
                     and Text.StartsWith([Name], Prefix)
-                    and [Folder Path] = folder & "\"),
+                    and [Folder Path] = path & "\"),
             y = Table.AddColumn(f, "Year", each Text.Start(Text.AfterDelimiter([Name], Prefix), 4), type text),
             p = if List.IsEmpty(PilotYears) then y else Table.SelectRows(y, each List.Contains(PilotYears, [Year])),
-            s = Table.AddColumn(p, "Side", each side, type text)
+            s = Table.AddColumn(p, "Side", each side, type text),
+            k = Table.AddColumn(s, "Part", each folder, type text)
         in
             if Table.RowCount(p) = 0
-            then error Error.Record("Gold contract violation", "G1 no " & Prefix & "*.parquet in " & folder)
-            else s,
-    Hist = ListFiles(HistFolder, "hist"),
-    Cur = ListFiles(CurFolder, "current"),
-    Overlap = List.Intersect({List.Distinct(Hist[Year]), List.Distinct(Cur[Year])}),
-    Files = if List.IsEmpty(Overlap) then Table.Combine({Hist, Cur})
+            then error Error.Record("Gold contract violation", "G1 no " & Prefix & "*.parquet in " & path)
+            else k,
+    Hist = ListFiles("hist", "hist"),
+    Cur = ListFiles("current", "current"),
+    ExtHist = if Scope = "full" then ListFiles("ext_hist", "hist") else Table.FirstN(Hist, 0),
+    ExtCur = if Scope = "full" then ListFiles("ext_current", "current") else Table.FirstN(Cur, 0),
+    HistSide = Table.Combine({Hist, ExtHist}),
+    CurSide = Table.Combine({Cur, ExtCur}),
+    Overlap = List.Intersect({List.Distinct(HistSide[Year]), List.Distinct(CurSide[Year])}),
+    Files = if List.IsEmpty(Overlap) then Table.Combine({HistSide, CurSide})
         else error Error.Record("Gold contract violation",
             "G2 year in both hist and current: " & Text.Combine(Overlap, ", ")),
     RefCols = List.Sort(Table.ColumnNames(Parquet.Document(Cur{0}[Content]))),
@@ -56,14 +66,23 @@ let
             lacking = List.Difference(RefCols, cols)
         in
             if not List.IsEmpty(missing) then error Error.Record("Gold contract violation",
-                "G3 " & [Name] & ": missing critical {" & Text.Combine(missing, ", ") & "}")
+                "G3 " & [Part] & "\" & [Name] & ": missing critical {" & Text.Combine(missing, ", ") & "}")
             else if not (List.IsEmpty(extra) and List.IsEmpty(lacking)) then error Error.Record("Gold contract violation",
-                "G3 " & [Name] & " (" & [Side] & ") differs from " & Cur{0}[Name] & ": extra {" & Text.Combine(extra, ", ")
-                & "} lacking {" & Text.Combine(lacking, ", ") & "}")
+                "G3 " & [Part] & "\" & [Name] & " differs from current\" & Cur{0}[Name] & ": extra {"
+                & Text.Combine(extra, ", ") & "} lacking {" & Text.Combine(lacking, ", ") & "}")
             else t),
     Combined = Table.Combine(Guarded[Data]),
     AnyCols = Table.SelectRows(Table.Schema(Combined), each [Kind] = "any")[Name],
     Result = if List.IsEmpty(AnyCols) then Combined
         else error Error.Record("Gold contract violation", "G4 column type differs between files: " & Text.Combine(AnyCols, ", "))
+in
+    Result
+
+// ===================================================================== B: ALLREPO_SCOPE_INFO (new query, loaded, no relationship)
+let
+    Note = if ALLREPO_SCOPE = "full" then "ALLREPO: full scope (every row)"
+        else "ALLREPO: repo (07L) on every date; CCP and intra-group repo and securities lending (07K) on month-ends and "
+            & "the last 90 days only; other risk codes (07F, 07Y, 07M, 10C) not loaded",
+    Result = #table(type table [Scope = text, Note = text], {{ALLREPO_SCOPE, Note}})
 in
     Result
