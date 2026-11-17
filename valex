@@ -1,0 +1,199 @@
+// =====================================================================================
+// ALLREPO_LITE_IDS_EXPORT.dax  -  BUILD 2026-11-16a  -  read-only
+// Exports the intra-group ids for the lite bake (runsheet step 3a): one column, HeadOfficeSirisId, every CPY flagged
+// DIM_COUNTERPARTY[IsIntraGroup] (group-managed funds included, Will 16 Nov). Ids only - no names.
+// DAX Studio: Output (ribbon) > File > CSV, run, save as
+//   H:\Documents\Python\ALLREPO_Lite\allrepo_lite_intragroup_ids.csv
+// Do NOT round-trip it through Excel (leading zeros); if it happens, the bake puts them back and counts them.
+// Re-export when the IsIntraGroup rule changes; the next bake rebuilds every file (the id list is in its fingerprint).
+// =====================================================================================
+EVALUATE
+SELECTCOLUMNS (
+    CALCULATETABLE ( VALUES ( DIM_COUNTERPARTY[HeadOfficeSirisId] ), DIM_COUNTERPARTY[IsIntraGroup] = TRUE () ),
+    "HeadOfficeSirisId", DIM_COUNTERPARTY[HeadOfficeSirisId]
+)
+ORDER BY [HeadOfficeSirisId]
+
+
+
+// =====================================================================================
+// ALLREPO_LITE_VALIDATION.dax  -  BUILD 2026-11-16f  -  read-only
+// Live FACT_ALLREPO (full gold) vs FACT_ALLREPO_LITE_TEST (lite gold, pilot years) in the working .pbix, BEFORE the swap.
+// Runsheet step 4. The bake has already compared every lite file with its gold file value by value; this file checks
+// that the model reads the lite files the same way (M types, rows, sums) and sizes what the rounding moves in the model.
+//
+// HOW TO RUN: DAX Studio on the working .pbix with FACT_ALLREPO_LITE_TEST loaded IN FULL SCOPE (parameter
+// ALLREPO_SCOPE = full: core + extension = every gold row, so lite must equal live). Paste the whole file > Run.
+// In core scope only LV1b is meaningful: its "Lite rows" must equal the bake report's core rows for the pilot years.
+// 5 result tabs. Only dates present in the test table are compared (pilot = 2025 + 2026).
+//   LV1 rows per date: one row per date that DIFFERS (empty = same on every date) - then a count line in LV1b
+//   LV2 per year, key text / id / date columns: distinct and non-blank, live vs lite (all "same" expected)
+//   LV3 per date, the eight rounded columns (LITE CONFIG v1.2) + two copied ones: max |diff| over the dates, and the
+//       bound rows x 500 EUR (half a rounding step per row - arithmetic, not a tolerance). Copied columns: the day sums
+//       are compared after ROUND ( , 2 ), because summing the same doubles in another row order moves the last digits
+//       (16 Nov pilot: 0.018 EUR on a day total) - the bake has already checked every copied value is identical.
+//   LV4 4 Nov 2026, HF scope (DIM_COUNTERPARTY[HF Scope] = "Hedge fund"), 07L ex-Sponsored: RiskNet 17A / 17B,
+//       face S, weighted haircut S, live vs lite; Part F figures shown for reference only
+//   LV5 schema: columns whose presence or data type differs between the two tables
+// FACT_ALLREPO_LITE_TEST has no relationship: HF scope reaches it through TREATAS on HeadOfficeSirisId.
+// =====================================================================================
+
+// ---- LV1 rows per date (differences only) -------------------------------------------------------
+EVALUATE
+VAR _d = CALCULATETABLE ( VALUES ( FACT_ALLREPO_LITE_TEST[SnapshotDate] ) )
+VAR _t =
+    ADDCOLUMNS (
+        _d,
+        "LiveRows", VAR _dd = [SnapshotDate] RETURN CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (), FACT_ALLREPO[SnapshotDate] = _dd ),
+        "LiteRows", VAR _dd = [SnapshotDate] RETURN CALCULATE ( COUNTROWS ( FACT_ALLREPO_LITE_TEST ), REMOVEFILTERS (), FACT_ALLREPO_LITE_TEST[SnapshotDate] = _dd )
+    )
+RETURN
+    FILTER ( _t, [LiveRows] <> [LiteRows] )
+ORDER BY [SnapshotDate]
+
+// ---- LV1b totals ---------------------------------------------------------------------------------
+EVALUATE
+VAR _d = CALCULATETABLE ( VALUES ( FACT_ALLREPO_LITE_TEST[SnapshotDate] ) )
+RETURN
+    ROW (
+        "Dates in lite test", COUNTROWS ( _d ),
+        "Lite rows", COUNTROWS ( FACT_ALLREPO_LITE_TEST ),
+        "Live rows on those dates", CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (), TREATAS ( _d, FACT_ALLREPO[SnapshotDate] ) ),
+        "Lite first date", MIN ( FACT_ALLREPO_LITE_TEST[SnapshotDate] ),
+        "Lite last date", MAX ( FACT_ALLREPO_LITE_TEST[SnapshotDate] ),
+        "Live last date", CALCULATE ( MAX ( FACT_ALLREPO[SnapshotDate] ), REMOVEFILTERS () )
+    )
+
+// ---- LV2 key columns per year: distinct and non-blank -----------------------------------------
+EVALUATE
+VAR _y = SELECTCOLUMNS ( CALCULATETABLE ( VALUES ( FACT_ALLREPO_LITE_TEST[SnapshotDate] ) ), "@y", YEAR ( [SnapshotDate] ) )
+VAR _years = DISTINCT ( _y )
+VAR _rows =
+    GENERATE (
+        _years,
+        VAR _yy = [@y]
+        VAR _dl = FILTER ( CALCULATETABLE ( VALUES ( FACT_ALLREPO_LITE_TEST[SnapshotDate] ) ), YEAR ( [SnapshotDate] ) = _yy )
+        RETURN
+            UNION (
+                ROW ( "Column", "HeadOfficeSirisId",
+                    "LiveDistinct", CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO[HeadOfficeSirisId] ), REMOVEFILTERS (), TREATAS ( _dl, FACT_ALLREPO[SnapshotDate] ) ),
+                    "LiteDistinct", CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO_LITE_TEST[HeadOfficeSirisId] ), TREATAS ( _dl, FACT_ALLREPO_LITE_TEST[SnapshotDate] ) ),
+                    "LiveNonBlank", CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (), TREATAS ( _dl, FACT_ALLREPO[SnapshotDate] ), FACT_ALLREPO[HeadOfficeSirisId] <> "" ),
+                    "LiteNonBlank", CALCULATE ( COUNTROWS ( FACT_ALLREPO_LITE_TEST ), TREATAS ( _dl, FACT_ALLREPO_LITE_TEST[SnapshotDate] ), FACT_ALLREPO_LITE_TEST[HeadOfficeSirisId] <> "" ) ),
+                ROW ( "Column", "CCCTradeKey",
+                    "LiveDistinct", CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO[CCCTradeKey] ), REMOVEFILTERS (), TREATAS ( _dl, FACT_ALLREPO[SnapshotDate] ) ),
+                    "LiteDistinct", CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO_LITE_TEST[CCCTradeKey] ), TREATAS ( _dl, FACT_ALLREPO_LITE_TEST[SnapshotDate] ) ),
+                    "LiveNonBlank", CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (), TREATAS ( _dl, FACT_ALLREPO[SnapshotDate] ), FACT_ALLREPO[CCCTradeKey] <> "" ),
+                    "LiteNonBlank", CALCULATE ( COUNTROWS ( FACT_ALLREPO_LITE_TEST ), TREATAS ( _dl, FACT_ALLREPO_LITE_TEST[SnapshotDate] ), FACT_ALLREPO_LITE_TEST[CCCTradeKey] <> "" ) ),
+                ROW ( "Column", "IssuerId",
+                    "LiveDistinct", CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO[IssuerId] ), REMOVEFILTERS (), TREATAS ( _dl, FACT_ALLREPO[SnapshotDate] ) ),
+                    "LiteDistinct", CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO_LITE_TEST[IssuerId] ), TREATAS ( _dl, FACT_ALLREPO_LITE_TEST[SnapshotDate] ) ),
+                    "LiveNonBlank", CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (), TREATAS ( _dl, FACT_ALLREPO[SnapshotDate] ), FACT_ALLREPO[IssuerId] <> "" ),
+                    "LiteNonBlank", CALCULATE ( COUNTROWS ( FACT_ALLREPO_LITE_TEST ), TREATAS ( _dl, FACT_ALLREPO_LITE_TEST[SnapshotDate] ), FACT_ALLREPO_LITE_TEST[IssuerId] <> "" ) ),
+                ROW ( "Column", "InstLabel",
+                    "LiveDistinct", CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO[InstLabel] ), REMOVEFILTERS (), TREATAS ( _dl, FACT_ALLREPO[SnapshotDate] ) ),
+                    "LiteDistinct", CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO_LITE_TEST[InstLabel] ), TREATAS ( _dl, FACT_ALLREPO_LITE_TEST[SnapshotDate] ) ),
+                    "LiveNonBlank", CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (), TREATAS ( _dl, FACT_ALLREPO[SnapshotDate] ), FACT_ALLREPO[InstLabel] <> "" ),
+                    "LiteNonBlank", CALCULATE ( COUNTROWS ( FACT_ALLREPO_LITE_TEST ), TREATAS ( _dl, FACT_ALLREPO_LITE_TEST[SnapshotDate] ), FACT_ALLREPO_LITE_TEST[InstLabel] <> "" ) ),
+                ROW ( "Column", "Rating_ssj",
+                    "LiveDistinct", CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO[Rating_ssj] ), REMOVEFILTERS (), TREATAS ( _dl, FACT_ALLREPO[SnapshotDate] ) ),
+                    "LiteDistinct", CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO_LITE_TEST[Rating_ssj] ), TREATAS ( _dl, FACT_ALLREPO_LITE_TEST[SnapshotDate] ) ),
+                    "LiveNonBlank", CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (), TREATAS ( _dl, FACT_ALLREPO[SnapshotDate] ), FACT_ALLREPO[Rating_ssj] <> "" ),
+                    "LiteNonBlank", CALCULATE ( COUNTROWS ( FACT_ALLREPO_LITE_TEST ), TREATAS ( _dl, FACT_ALLREPO_LITE_TEST[SnapshotDate] ), FACT_ALLREPO_LITE_TEST[Rating_ssj] <> "" ) ),
+                ROW ( "Column", "_SourceFile",
+                    "LiveDistinct", CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO[_SourceFile] ), REMOVEFILTERS (), TREATAS ( _dl, FACT_ALLREPO[SnapshotDate] ) ),
+                    "LiteDistinct", CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO_LITE_TEST[_SourceFile] ), TREATAS ( _dl, FACT_ALLREPO_LITE_TEST[SnapshotDate] ) ),
+                    "LiveNonBlank", CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (), TREATAS ( _dl, FACT_ALLREPO[SnapshotDate] ), FACT_ALLREPO[_SourceFile] <> "" ),
+                    "LiteNonBlank", CALCULATE ( COUNTROWS ( FACT_ALLREPO_LITE_TEST ), TREATAS ( _dl, FACT_ALLREPO_LITE_TEST[SnapshotDate] ), FACT_ALLREPO_LITE_TEST[_SourceFile] <> "" ) ),
+                ROW ( "Column", "TradeDate",
+                    "LiveDistinct", CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO[TradeDate] ), REMOVEFILTERS (), TREATAS ( _dl, FACT_ALLREPO[SnapshotDate] ) ),
+                    "LiteDistinct", CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO_LITE_TEST[TradeDate] ), TREATAS ( _dl, FACT_ALLREPO_LITE_TEST[SnapshotDate] ) ),
+                    "LiveNonBlank", CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (), TREATAS ( _dl, FACT_ALLREPO[SnapshotDate] ), NOT ISBLANK ( FACT_ALLREPO[TradeDate] ) ),
+                    "LiteNonBlank", CALCULATE ( COUNTROWS ( FACT_ALLREPO_LITE_TEST ), TREATAS ( _dl, FACT_ALLREPO_LITE_TEST[SnapshotDate] ), NOT ISBLANK ( FACT_ALLREPO_LITE_TEST[TradeDate] ) ) ),
+                ROW ( "Column", "MaturityDate",
+                    "LiveDistinct", CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO[MaturityDate] ), REMOVEFILTERS (), TREATAS ( _dl, FACT_ALLREPO[SnapshotDate] ) ),
+                    "LiteDistinct", CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO_LITE_TEST[MaturityDate] ), TREATAS ( _dl, FACT_ALLREPO_LITE_TEST[SnapshotDate] ) ),
+                    "LiveNonBlank", CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (), TREATAS ( _dl, FACT_ALLREPO[SnapshotDate] ), NOT ISBLANK ( FACT_ALLREPO[MaturityDate] ) ),
+                    "LiteNonBlank", CALCULATE ( COUNTROWS ( FACT_ALLREPO_LITE_TEST ), TREATAS ( _dl, FACT_ALLREPO_LITE_TEST[SnapshotDate] ), NOT ISBLANK ( FACT_ALLREPO_LITE_TEST[MaturityDate] ) ) ),
+                ROW ( "Column", "StartDate",
+                    "LiveDistinct", CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO[StartDate] ), REMOVEFILTERS (), TREATAS ( _dl, FACT_ALLREPO[SnapshotDate] ) ),
+                    "LiteDistinct", CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO_LITE_TEST[StartDate] ), TREATAS ( _dl, FACT_ALLREPO_LITE_TEST[SnapshotDate] ) ),
+                    "LiveNonBlank", CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (), TREATAS ( _dl, FACT_ALLREPO[SnapshotDate] ), NOT ISBLANK ( FACT_ALLREPO[StartDate] ) ),
+                    "LiteNonBlank", CALCULATE ( COUNTROWS ( FACT_ALLREPO_LITE_TEST ), TREATAS ( _dl, FACT_ALLREPO_LITE_TEST[SnapshotDate] ), NOT ISBLANK ( FACT_ALLREPO_LITE_TEST[StartDate] ) ) )
+            )
+    )
+RETURN
+    ADDCOLUMNS ( _rows, "Check", IF ( [LiveDistinct] = [LiteDistinct] && [LiveNonBlank] = [LiteNonBlank], "same", "DIFF" ) )
+ORDER BY [@y], [Column]
+
+// ---- LV3 amounts per date: max |diff| over the dates vs the arithmetic bound ------------------
+EVALUATE
+VAR _d =
+    ADDCOLUMNS (
+        CALCULATETABLE ( VALUES ( FACT_ALLREPO_LITE_TEST[SnapshotDate] ) ),
+        "@rows", VAR _dd = [SnapshotDate] RETURN CALCULATE ( COUNTROWS ( FACT_ALLREPO_LITE_TEST ), FACT_ALLREPO_LITE_TEST[SnapshotDate] = _dd ),
+        "@RiskNet", VAR _dd = [SnapshotDate] RETURN CALCULATE ( SUM ( FACT_ALLREPO[RiskNet_EUR] ), REMOVEFILTERS (), FACT_ALLREPO[SnapshotDate] = _dd ) - CALCULATE ( SUM ( FACT_ALLREPO_LITE_TEST[RiskNet_EUR] ), FACT_ALLREPO_LITE_TEST[SnapshotDate] = _dd ),
+        "@RiskBrut", VAR _dd = [SnapshotDate] RETURN CALCULATE ( SUM ( FACT_ALLREPO[RiskBrut_EUR] ), REMOVEFILTERS (), FACT_ALLREPO[SnapshotDate] = _dd ) - CALCULATE ( SUM ( FACT_ALLREPO_LITE_TEST[RiskBrut_EUR] ), FACT_ALLREPO_LITE_TEST[SnapshotDate] = _dd ),
+        "@Cash", VAR _dd = [SnapshotDate] RETURN CALCULATE ( SUM ( FACT_ALLREPO[CashAmount_EUR] ), REMOVEFILTERS (), FACT_ALLREPO[SnapshotDate] = _dd ) - CALCULATE ( SUM ( FACT_ALLREPO_LITE_TEST[CashAmount_EUR] ), FACT_ALLREPO_LITE_TEST[SnapshotDate] = _dd ),
+        "@Face", VAR _dd = [SnapshotDate] RETURN CALCULATE ( SUM ( FACT_ALLREPO[NotionalBond_EUR] ), REMOVEFILTERS (), FACT_ALLREPO[SnapshotDate] = _dd ) - CALCULATE ( SUM ( FACT_ALLREPO_LITE_TEST[NotionalBond_EUR] ), FACT_ALLREPO_LITE_TEST[SnapshotDate] = _dd ),
+        "@MtMSec", VAR _dd = [SnapshotDate] RETURN CALCULATE ( SUM ( FACT_ALLREPO[MTMSecurity_EUR] ), REMOVEFILTERS (), FACT_ALLREPO[SnapshotDate] = _dd ) - CALCULATE ( SUM ( FACT_ALLREPO_LITE_TEST[MTMSecurity_EUR] ), FACT_ALLREPO_LITE_TEST[SnapshotDate] = _dd ),
+        "@MtMCash", VAR _dd = [SnapshotDate] RETURN CALCULATE ( SUM ( FACT_ALLREPO[MTMCash_EUR] ), REMOVEFILTERS (), FACT_ALLREPO[SnapshotDate] = _dd ) - CALCULATE ( SUM ( FACT_ALLREPO_LITE_TEST[MTMCash_EUR] ), FACT_ALLREPO_LITE_TEST[SnapshotDate] = _dd ),
+        "@BuyEUR", VAR _dd = [SnapshotDate] RETURN CALCULATE ( SUM ( FACT_ALLREPO[AmountBuy_EUR] ), REMOVEFILTERS (), FACT_ALLREPO[SnapshotDate] = _dd ) - CALCULATE ( SUM ( FACT_ALLREPO_LITE_TEST[AmountBuy_EUR] ), FACT_ALLREPO_LITE_TEST[SnapshotDate] = _dd ),
+        "@SellEUR", VAR _dd = [SnapshotDate] RETURN CALCULATE ( SUM ( FACT_ALLREPO[AmountSell_EUR] ), REMOVEFILTERS (), FACT_ALLREPO[SnapshotDate] = _dd ) - CALCULATE ( SUM ( FACT_ALLREPO_LITE_TEST[AmountSell_EUR] ), FACT_ALLREPO_LITE_TEST[SnapshotDate] = _dd ),
+        "@Haircut", VAR _dd = [SnapshotDate] RETURN CALCULATE ( SUM ( FACT_ALLREPO[Haircut] ), REMOVEFILTERS (), FACT_ALLREPO[SnapshotDate] = _dd ) - CALCULATE ( SUM ( FACT_ALLREPO_LITE_TEST[Haircut] ), FACT_ALLREPO_LITE_TEST[SnapshotDate] = _dd ),
+        "@IA", VAR _dd = [SnapshotDate] RETURN CALCULATE ( SUM ( FACT_ALLREPO[IA_EUR] ), REMOVEFILTERS (), FACT_ALLREPO[SnapshotDate] = _dd ) - CALCULATE ( SUM ( FACT_ALLREPO_LITE_TEST[IA_EUR] ), FACT_ALLREPO_LITE_TEST[SnapshotDate] = _dd )
+    )
+VAR _bound = MAXX ( _d, [@rows] ) * 500
+RETURN
+    UNION (
+        ROW ( "Column", "RiskNet_EUR (rounded)", "MaxAbsDayDiffEUR", MAXX ( _d, ABS ( [@RiskNet] ) ), "DayBoundEUR", _bound, "DatesOverBound", COUNTROWS ( FILTER ( _d, ABS ( [@RiskNet] ) > [@rows] * 500 ) ) ),
+        ROW ( "Column", "RiskBrut_EUR (rounded)", "MaxAbsDayDiffEUR", MAXX ( _d, ABS ( [@RiskBrut] ) ), "DayBoundEUR", _bound, "DatesOverBound", COUNTROWS ( FILTER ( _d, ABS ( [@RiskBrut] ) > [@rows] * 500 ) ) ),
+        ROW ( "Column", "CashAmount_EUR (rounded)", "MaxAbsDayDiffEUR", MAXX ( _d, ABS ( [@Cash] ) ), "DayBoundEUR", _bound, "DatesOverBound", COUNTROWS ( FILTER ( _d, ABS ( [@Cash] ) > [@rows] * 500 ) ) ),
+        ROW ( "Column", "NotionalBond_EUR (rounded)", "MaxAbsDayDiffEUR", MAXX ( _d, ABS ( [@Face] ) ), "DayBoundEUR", _bound, "DatesOverBound", COUNTROWS ( FILTER ( _d, ABS ( [@Face] ) > [@rows] * 500 ) ) ),
+        ROW ( "Column", "MTMSecurity_EUR (rounded)", "MaxAbsDayDiffEUR", MAXX ( _d, ABS ( [@MtMSec] ) ), "DayBoundEUR", _bound, "DatesOverBound", COUNTROWS ( FILTER ( _d, ABS ( [@MtMSec] ) > [@rows] * 500 ) ) ),
+        ROW ( "Column", "MTMCash_EUR (rounded)", "MaxAbsDayDiffEUR", MAXX ( _d, ABS ( [@MtMCash] ) ), "DayBoundEUR", _bound, "DatesOverBound", COUNTROWS ( FILTER ( _d, ABS ( [@MtMCash] ) > [@rows] * 500 ) ) ),
+        ROW ( "Column", "AmountBuy_EUR (rounded)", "MaxAbsDayDiffEUR", MAXX ( _d, ABS ( [@BuyEUR] ) ), "DayBoundEUR", _bound, "DatesOverBound", COUNTROWS ( FILTER ( _d, ABS ( [@BuyEUR] ) > [@rows] * 500 ) ) ),
+        ROW ( "Column", "AmountSell_EUR (rounded)", "MaxAbsDayDiffEUR", MAXX ( _d, ABS ( [@SellEUR] ) ), "DayBoundEUR", _bound, "DatesOverBound", COUNTROWS ( FILTER ( _d, ABS ( [@SellEUR] ) > [@rows] * 500 ) ) ),
+        ROW ( "Column", "Haircut (copied)", "MaxAbsDayDiffEUR", MAXX ( _d, ABS ( [@Haircut] ) ), "DayBoundEUR", 0, "DatesOverBound", COUNTROWS ( FILTER ( _d, ROUND ( [@Haircut], 2 ) <> 0 ) ) ),
+        ROW ( "Column", "IA_EUR (copied)", "MaxAbsDayDiffEUR", MAXX ( _d, ABS ( [@IA] ) ), "DayBoundEUR", 0, "DatesOverBound", COUNTROWS ( FILTER ( _d, ROUND ( [@IA], 2 ) <> 0 ) ) )
+    )
+
+// ---- LV4 HF repo figures at 4 Nov 2026, live vs lite (Part F for reference) -------------------
+EVALUATE
+VAR _dt = DATE ( 2026, 11, 4 )
+VAR _hf = CALCULATETABLE ( VALUES ( DIM_COUNTERPARTY[HeadOfficeSirisId] ), REMOVEFILTERS ( DIM_COUNTERPARTY ), DIM_COUNTERPARTY[HF Scope] = "Hedge fund" )
+VAR _liveB = CALCULATE ( SUM ( FACT_ALLREPO[RiskNet_EUR] ), REMOVEFILTERS (), FACT_ALLREPO[SnapshotDate] = _dt, FACT_ALLREPO[SLA_CateCode] = "07L", FACT_ALLREPO[BuySell] = "B", KEEPFILTERS ( FILTER ( ALL ( FACT_ALLREPO[InstLabel] ), NOT CONTAINSSTRING ( FACT_ALLREPO[InstLabel], "Sponsored" ) ) ), TREATAS ( _hf, FACT_ALLREPO[HeadOfficeSirisId] ) )
+VAR _liteB = CALCULATE ( SUM ( FACT_ALLREPO_LITE_TEST[RiskNet_EUR] ), FACT_ALLREPO_LITE_TEST[SnapshotDate] = _dt, FACT_ALLREPO_LITE_TEST[SLA_CateCode] = "07L", FACT_ALLREPO_LITE_TEST[BuySell] = "B", KEEPFILTERS ( FILTER ( ALL ( FACT_ALLREPO_LITE_TEST[InstLabel] ), NOT CONTAINSSTRING ( FACT_ALLREPO_LITE_TEST[InstLabel], "Sponsored" ) ) ), TREATAS ( _hf, FACT_ALLREPO_LITE_TEST[HeadOfficeSirisId] ) )
+VAR _liveS = CALCULATE ( SUM ( FACT_ALLREPO[RiskNet_EUR] ), REMOVEFILTERS (), FACT_ALLREPO[SnapshotDate] = _dt, FACT_ALLREPO[SLA_CateCode] = "07L", FACT_ALLREPO[BuySell] = "S", KEEPFILTERS ( FILTER ( ALL ( FACT_ALLREPO[InstLabel] ), NOT CONTAINSSTRING ( FACT_ALLREPO[InstLabel], "Sponsored" ) ) ), TREATAS ( _hf, FACT_ALLREPO[HeadOfficeSirisId] ) )
+VAR _liteS = CALCULATE ( SUM ( FACT_ALLREPO_LITE_TEST[RiskNet_EUR] ), FACT_ALLREPO_LITE_TEST[SnapshotDate] = _dt, FACT_ALLREPO_LITE_TEST[SLA_CateCode] = "07L", FACT_ALLREPO_LITE_TEST[BuySell] = "S", KEEPFILTERS ( FILTER ( ALL ( FACT_ALLREPO_LITE_TEST[InstLabel] ), NOT CONTAINSSTRING ( FACT_ALLREPO_LITE_TEST[InstLabel], "Sponsored" ) ) ), TREATAS ( _hf, FACT_ALLREPO_LITE_TEST[HeadOfficeSirisId] ) )
+VAR _liveFace = CALCULATE ( SUM ( FACT_ALLREPO[NotionalBond_EUR] ), REMOVEFILTERS (), FACT_ALLREPO[SnapshotDate] = _dt, FACT_ALLREPO[SLA_CateCode] = "07L", FACT_ALLREPO[BuySell] = "S", KEEPFILTERS ( FILTER ( ALL ( FACT_ALLREPO[InstLabel] ), NOT CONTAINSSTRING ( FACT_ALLREPO[InstLabel], "Sponsored" ) ) ), TREATAS ( _hf, FACT_ALLREPO[HeadOfficeSirisId] ) )
+VAR _liteFace = CALCULATE ( SUM ( FACT_ALLREPO_LITE_TEST[NotionalBond_EUR] ), FACT_ALLREPO_LITE_TEST[SnapshotDate] = _dt, FACT_ALLREPO_LITE_TEST[SLA_CateCode] = "07L", FACT_ALLREPO_LITE_TEST[BuySell] = "S", KEEPFILTERS ( FILTER ( ALL ( FACT_ALLREPO_LITE_TEST[InstLabel] ), NOT CONTAINSSTRING ( FACT_ALLREPO_LITE_TEST[InstLabel], "Sponsored" ) ) ), TREATAS ( _hf, FACT_ALLREPO_LITE_TEST[HeadOfficeSirisId] ) )
+VAR _liveHc = DIVIDE (
+    CALCULATE ( SUMX ( FACT_ALLREPO, FACT_ALLREPO[NotionalBond_EUR] * FACT_ALLREPO[Haircut] ), REMOVEFILTERS (), FACT_ALLREPO[SnapshotDate] = _dt, FACT_ALLREPO[SLA_CateCode] = "07L", FACT_ALLREPO[BuySell] = "S", FACT_ALLREPO[Haircut] >= 0, FACT_ALLREPO[Haircut] < 1, KEEPFILTERS ( FILTER ( ALL ( FACT_ALLREPO[InstLabel] ), NOT CONTAINSSTRING ( FACT_ALLREPO[InstLabel], "Sponsored" ) ) ), TREATAS ( _hf, FACT_ALLREPO[HeadOfficeSirisId] ) ),
+    CALCULATE ( SUM ( FACT_ALLREPO[NotionalBond_EUR] ), REMOVEFILTERS (), FACT_ALLREPO[SnapshotDate] = _dt, FACT_ALLREPO[SLA_CateCode] = "07L", FACT_ALLREPO[BuySell] = "S", FACT_ALLREPO[Haircut] >= 0, FACT_ALLREPO[Haircut] < 1, KEEPFILTERS ( FILTER ( ALL ( FACT_ALLREPO[InstLabel] ), NOT CONTAINSSTRING ( FACT_ALLREPO[InstLabel], "Sponsored" ) ) ), TREATAS ( _hf, FACT_ALLREPO[HeadOfficeSirisId] ) ) )
+VAR _liteHc = DIVIDE (
+    CALCULATE ( SUMX ( FACT_ALLREPO_LITE_TEST, FACT_ALLREPO_LITE_TEST[NotionalBond_EUR] * FACT_ALLREPO_LITE_TEST[Haircut] ), FACT_ALLREPO_LITE_TEST[SnapshotDate] = _dt, FACT_ALLREPO_LITE_TEST[SLA_CateCode] = "07L", FACT_ALLREPO_LITE_TEST[BuySell] = "S", FACT_ALLREPO_LITE_TEST[Haircut] >= 0, FACT_ALLREPO_LITE_TEST[Haircut] < 1, KEEPFILTERS ( FILTER ( ALL ( FACT_ALLREPO_LITE_TEST[InstLabel] ), NOT CONTAINSSTRING ( FACT_ALLREPO_LITE_TEST[InstLabel], "Sponsored" ) ) ), TREATAS ( _hf, FACT_ALLREPO_LITE_TEST[HeadOfficeSirisId] ) ),
+    CALCULATE ( SUM ( FACT_ALLREPO_LITE_TEST[NotionalBond_EUR] ), FACT_ALLREPO_LITE_TEST[SnapshotDate] = _dt, FACT_ALLREPO_LITE_TEST[SLA_CateCode] = "07L", FACT_ALLREPO_LITE_TEST[BuySell] = "S", FACT_ALLREPO_LITE_TEST[Haircut] >= 0, FACT_ALLREPO_LITE_TEST[Haircut] < 1, KEEPFILTERS ( FILTER ( ALL ( FACT_ALLREPO_LITE_TEST[InstLabel] ), NOT CONTAINSSTRING ( FACT_ALLREPO_LITE_TEST[InstLabel], "Sponsored" ) ) ), TREATAS ( _hf, FACT_ALLREPO_LITE_TEST[HeadOfficeSirisId] ) ) )
+RETURN
+    {
+        ( "RiskNet 17A (B) EUR", _liveB, _liteB, _liveB - _liteB, "39.1m" ),
+        ( "RiskNet 17B (S) EUR", _liveS, _liteS, _liveS - _liteS, "75.4m" ),
+        ( "RiskNet 17A + 17B EUR", _liveB + _liveS, _liteB + _liteS, _liveB + _liveS - _liteB - _liteS, "114.5m" ),
+        ( "Face S EUR", _liveFace, _liteFace, _liveFace - _liteFace, "64.2bn" ),
+        ( "Weighted haircut S (bp)", _liveHc * 10000, _liteHc * 10000, ( _liveHc - _liteHc ) * 10000, "34 bp" )
+    }
+
+// ---- LV5 schema: columns whose presence or data type differs ----------------------------------
+EVALUATE
+VAR _live = SELECTCOLUMNS ( FILTER ( INFO.VIEW.COLUMNS (), [Table] = "FACT_ALLREPO" ), "Column", [Name], "LiveType", [DataType] )
+VAR _lite = SELECTCOLUMNS ( FILTER ( INFO.VIEW.COLUMNS (), [Table] = "FACT_ALLREPO_LITE_TEST" ), "Column", [Name], "LiteType", [DataType] )
+VAR _names = DISTINCT ( UNION ( SELECTCOLUMNS ( _live, "Column", [Column] ), SELECTCOLUMNS ( _lite, "Column", [Column] ) ) )
+VAR _t =
+    ADDCOLUMNS (
+        _names,
+        "LiveType", VAR _c = [Column] RETURN MAXX ( FILTER ( _live, [Column] = _c ), [LiveType] ),
+        "LiteType", VAR _c = [Column] RETURN MAXX ( FILTER ( _lite, [Column] = _c ), [LiteType] )
+    )
+RETURN
+    FILTER ( _t, [LiveType] <> [LiteType] || ISBLANK ( [LiveType] ) || ISBLANK ( [LiteType] ) )
+ORDER BY [Column]
