@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =====================================================================================
-# allrepo_lite_selftest.py  -  BUILD 2026-11-16f
+# allrepo_lite_selftest.py  -  BUILD 2026-11-17a
 # Selftest for allrepo_lite_run.py. Builds a small synthetic full gold in a temp folder (never touches G: or H:),
 # runs the bake on it and asserts on the output AND on what each run touches (file mtime_ns, files built / removed).
 # The core / extension split is checked against an independent restatement of the rule written here (not the bake's
@@ -24,14 +24,14 @@ import pyarrow.parquet as pq
 import allrepo_lite_config as C
 import allrepo_lite_run as R
 
-BUILD = "2026-11-16f"
+BUILD = "2026-11-17a"
 RESULTS = []
 ROUND = ["RiskNet_EUR", "RiskBrut_EUR", "CashAmount_EUR", "NotionalBond_EUR", "MTMSecurity_EUR", "MTMCash_EUR",
          "AmountBuy_EUR", "AmountSell_EUR"]
 DROPPED = ("AmountBuy", "AmountSell", "FO_ID", "MarkToMark_EUR", "MTMCash", "MTMSecurity", "SumAmountBuySell_EUR",
            "TransactionId")
-SLAS = ["07L", "07L", "07L", "07K", "07F", "07Y", "07L", None]
-CATS = ["FCG21", "BCG24", "MCG41", "FCG23", "BCG24", None]
+SLAS = ["07L", "07L", "07L", "07K", "07F", "07Y", "07L", None, "07l", " 07L", "07k "]   # spellings as Power BI would merge
+CATS = ["FCG21", "BCG24", "MCG41", "FCG23", "BCG24", None, "fcg21 "]
 IDS_IN_FILE = ["0000000005", "0000000007", "0000000009"]      # written padded, unpadded and quoted below
 ORIG = {"DROP": list(C.DROP_COLUMNS), "ROUND": dict(C.ROUND_COLUMNS), "STORE": C.ROUND_STORE,
         "RG": C.ROW_GROUP_ROWS, "SLICE": R.SLICE_ROWS, "WAIT": R.REPLACE_WAIT_S, "WSLA": list(C.WINDOW_SLA),
@@ -159,6 +159,8 @@ def all_gold_dates(h, c):
 def rule_core(row, window, ids):
     """Independent restatement of LITE CONFIG v1.3 (not the bake's code)."""
     sla, cat, cid, d = row["SLA_CateCode"], row["Category"], row["HeadOfficeSirisId"], row["SnapshotDate"]
+    sla = sla.strip().upper() if sla is not None else None          # Power BI: case-insensitive, trimmed
+    cat = cat.strip().upper() if cat is not None else None
     win = d in window
     if sla == "07L":
         thinned = cat == "FCG21" or cid in ids
@@ -230,28 +232,38 @@ def tests(root):
     core = pq.read_table(os.path.join(lite, "hist", names[0]))
     ext = pq.read_table(os.path.join(lite, "ext_hist", names[0]))
     g = pq.read_table(os.path.join(h, "FACT_ALLREPO_gold_2024.parquet"))
+    N = lambda v: v.strip().upper() if v is not None else None
     check("T2 hist: CCP 07L rows in core only on the month-end", all(
         r["SnapshotDate"] == dt.date(2024, 3, 20) for r in core.to_pylist()
-        if r["Category"] == "FCG21" and r["SLA_CateCode"] == "07L"))
+        if N(r["Category"]) == "FCG21" and N(r["SLA_CateCode"]) == "07L"))
+    check("T2 '07l' / ' 07L' rows of ordinary clients in core on every date (as Power BI reads them)",
+          sorted(r["Trades"] for r in g.to_pylist() if r["SLA_CateCode"] in ("07l", " 07L") and N(r["Category"]) != "FCG21"
+                 and r["HeadOfficeSirisId"] not in IDS_IN_FILE)
+          == sorted(r["Trades"] for r in core.to_pylist() if r["SLA_CateCode"] in ("07l", " 07L")
+                    and N(r["Category"]) != "FCG21" and r["HeadOfficeSirisId"] not in IDS_IN_FILE)
+          and any(r["SLA_CateCode"] == "07l" for r in core.to_pylist()))
+    check("T2 'fcg21 ' rows thinned like FCG21", all(r["SnapshotDate"] == dt.date(2024, 3, 20) for r in core.to_pylist()
+          if r["Category"] == "fcg21 " and N(r["SLA_CateCode"]) == "07L"))
+    check("T2 report counts rows written in another spelling", "in another case or with spaces" in out)
     check("T2 hist: intra-group 07L rows in core only on the month-end", all(
         r["SnapshotDate"] == dt.date(2024, 3, 20) for r in core.to_pylist()
-        if r["HeadOfficeSirisId"] in IDS_IN_FILE and r["SLA_CateCode"] == "07L"))
+        if r["HeadOfficeSirisId"] in IDS_IN_FILE and N(r["SLA_CateCode"]) == "07L"))
     check("T2 hist: other 07L rows in core on every date", sorted({r["SnapshotDate"] for r in core.to_pylist()
-          if r["SLA_CateCode"] == "07L" and r["Category"] != "FCG21" and r["HeadOfficeSirisId"] not in IDS_IN_FILE})
+          if N(r["SLA_CateCode"]) == "07L" and N(r["Category"]) != "FCG21" and r["HeadOfficeSirisId"] not in IDS_IN_FILE})
           == sorted(set(g.column("SnapshotDate").to_pylist())))
     check("T2 hist: 07K in core only on the month-end", {r["SnapshotDate"] for r in core.to_pylist()
-          if r["SLA_CateCode"] == "07K"} == {dt.date(2024, 3, 20)})
+          if N(r["SLA_CateCode"]) == "07K"} == {dt.date(2024, 3, 20)})
     check("T2 07F / 07Y / null SLA never in core", not [r for r in core.to_pylist()
-          if r["SLA_CateCode"] not in ("07L", "07K")])
-    check("T2 null Category + 07L = not thinned (core every date)", any(r["Category"] is None and r["SLA_CateCode"] == "07L"
+          if N(r["SLA_CateCode"]) not in ("07L", "07K")])
+    check("T2 null Category + 07L = not thinned (core every date)", any(r["Category"] is None and N(r["SLA_CateCode"]) == "07L"
           and r["SnapshotDate"] != dt.date(2024, 3, 20) and r["HeadOfficeSirisId"] not in IDS_IN_FILE
           for r in core.to_pylist()))
     cc = pq.read_table(os.path.join(lite, "current", cur[0])).to_pylist()
     gc = pq.read_table(os.path.join(c, "FACT_ALLREPO_gold_2026-09.parquet")).to_pylist()
-    ccp = lambda rows: sorted(r["Trades"] for r in rows if r["Category"] == "FCG21" and r["SLA_CateCode"] == "07L")
-    k07 = lambda rows: sorted(r["Trades"] for r in rows if r["SLA_CateCode"] == "07K")
+    ccp = lambda rows: sorted(r["Trades"] for r in rows if N(r["Category"]) == "FCG21" and N(r["SLA_CateCode"]) == "07L")
+    k07 = lambda rows: sorted(r["Trades"] for r in rows if N(r["SLA_CateCode"]) == "07K")
     check("T2 current month inside the 90 days: every CCP 07L and 07K row kept in core",
-          ccp(cc) == ccp(gc) and k07(cc) == k07(gc) and len({r["SnapshotDate"] for r in gc if r["SLA_CateCode"] == "07K"}) > 1)
+          ccp(cc) == ccp(gc) and k07(cc) == k07(gc) and len({r["SnapshotDate"] for r in gc if N(r["SLA_CateCode"]) == "07K"}) > 1)
     check("T2 core and ext share one schema", core.schema.equals(ext.schema))
     check("T2 several row groups", pq.ParquetFile(os.path.join(lite, "hist", names[0])).metadata.num_row_groups >= 1
           and pq.ParquetFile(os.path.join(lite, "ext_hist", names[0])).metadata.num_row_groups >= 2)
@@ -333,7 +345,7 @@ def tests(root):
     code, out = run(h, c, lite, ids)
     c24 = pq.read_table(os.path.join(lite, "current", cur[0]))
     check("T24 split config change rebuilds all and moves 07K out of core", len(built_lines(out)) == 4
-          and not [r for r in c24.to_pylist() if r["SLA_CateCode"] == "07K"])
+          and not [r for r in c24.to_pylist() if N(r["SLA_CateCode"]) == "07K"])
     reset_config()
     small()
     run(h, c, lite, ids)
@@ -501,7 +513,7 @@ def tests(root):
     c23, e23 = check_pair("T23 2026-09", os.path.join(c, "FACT_ALLREPO_gold_2026-09.parquet"), lite,
                           os.path.join("current", cur[0]), win23)
     check("T23 September CCP / 07K rows now in core only on 30-day month-end",
-          {r["SnapshotDate"] for r in c23.to_pylist() if r["SLA_CateCode"] == "07K"} == {dt.date(2026, 9, 20)})
+          {r["SnapshotDate"] for r in c23.to_pylist() if N(r["SLA_CateCode"]) == "07K"} == {dt.date(2026, 9, 20)})
     code, out = run(h, c, lite, ids)
     check("T23 next run touches nothing", code == 0 and not built_lines(out))
 
