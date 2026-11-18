@@ -1,191 +1,20 @@
 // =====================================================================================
-// PX_PRICE_CHECK.dax  -  BUILD 2026-11-18d  -  read-only, after P6W_SETUP_PATCH_08 + P6A_MEASURES_TE2.csx 2026-11-18d (+ Ctrl+S)
-// PX6 bond-price table and PX7 price evolution, on the LITER .pbix (MTMSecurity_EUR / NotionalBond_EUR rounded to EUR 1k:
-// prices are exact to about 0.01 pt on bonds with EUR 100m+ face across all clients; small lines can show noise).
-// Same case as PX_CHECK (6 -> 11 Nov). Set _ids (same Ricos). Note the ms of each tab (Server timings in DAX Studio, or
-// the query duration at the bottom of DAX query view).
-//
-// EXPECTED
-//   P1  one row. MtMHeld_m = the "… trades held" row of PX4 = PriceEffect_m + CashLeg_m + StartedInWindow_m exactly.
-//       18a run (6 -> 11 Nov): held +29.2 = prices -311.8 + cash +341.1 -> trades starting inside the window were counted
-//       as price moves. 18b: prices / cash = trades started on BOTH files; start-ups on their own line. Expect PriceEffect_m
-//       and CashLeg_m small (a few €m), StartedInWindow_m carrying most of the old -311.8 / +341.1.
-//       PriceEffect_m = the total row of PX6 (sum of all ISINs, not only the top 10).
-//   P2  the 15 largest ISINs by |effect|: net face (€m, + = we delivered the bond / repo, − = we hold it / rev. repo),
-//       dirty price start / end, change in points, effect (€m, + = against us). Sanity: effect ≈ net face held × Δ pts / 100
-//       (only approximately: face here is the end face of ALL started trades, effect is trades held on both dates).
-//   P3  daily price of the 3 largest-effect ISINs on each ALLREPO file of the window (= the PX7 lines). Move_pts on the
-//       start file = 0; on the end file = P2 Chg_pts.
-//   P1 (18d) MarketPart_m + OffMarketPart_m = PriceEffect_m. OffMarketPart_m = the move explained by the client's booked prices
-//       being away from the market price (median of all clients' rows). BondsToCheck = bonds flagged at 1 pt (default).
-//   P2 (18d) per bond: booked price (client's own rows) vs market, gap at start / end, Effect_m = Market_m + OffMkt_m, Flag.
-//   P6  (18d) the client's own rows of the 3 bonds with the largest |off-market| part, start and end file: trade key,
-//       side, start date, face, bond MtM, row price, market price, gap and that row's off-market MtM. A flagged bond can be
-//       traced to the trades (and the booking) behind it.
-//   P4  how many ISINs the client holds at start / end (rows the table can show) - for timing context.
-//   P5  diagnostic if prices still look wrong (govies should move < 2 pts a day): the 3 largest ISINs, every file of the
-//       window, ALL clients: rows, rows with no bond MtM, forward-starting face, the price as the measure computes it
-//       (18c = RowPriceMedian) vs over all rows (18a) and the clean weighted ratio (18b), and the per-row price median / min / max (clean rows). If min / max are far
-//       apart on one date, the per-row ratio itself is not a price (e.g. face and bond MtM on different bases).
+// P6W_SETUP_PATCH_08.dax  -  BUILD 2026-11-18f  -  PX bond-price table: flag threshold (S1, 18d) + side slicer (S2, 18f)
+// Run BEFORE P6A_MEASURES_TE2.csx build 2026-11-18f (S1 already in? paste S2 only) (the script stops if this table is missing).
+// HOW: Modeling ▸ New table ▸ paste the block (name included) ▸ Enter. No relationship.
+// Then: Points ▸ Column tools ▸ Format ▸ Decimal, 1 decimal place. Sort Label by Order; hide Order.
+// The values are only choices offered on the slicer: pick the default on the page (save the page with it selected).
 // =====================================================================================
-DEFINE
-    VAR _ids = { "0000000000" }                 // <- the fund's Ricos
-    VAR _ctx = TREATAS ( _ids, DIM_COUNTERPARTY[HeadOfficeSirisId] )
-    VAR _win = TREATAS ( { "Custom" }, 'PX Window'[Window] )
-    VAR _from = TREATAS ( { DATE ( 2026, 11, 6 ) }, 'PX From'[Date] )
-    VAR _to = TREATAS ( { DATE ( 2026, 11, 11 ) }, 'PX To'[Date] )
 
-// ---- P1 tie-out
-EVALUATE
-    CALCULATETABLE (
-        ROW (
-            "R0", [PX R0], "R1", [PX R1],
-            "MtMHeld_m", [PX MtM Held] / 1E6,
-            "PriceEffect_m", [PX P Price Total] / 1E6,
-            "MarketPart_m", [PX P Price Total] / 1E6 - COALESCE ( [PX P Offmkt Effect], 0 ),
-            "OffMarketPart_m", COALESCE ( [PX P Offmkt Effect], 0 ),
-            "BondsToCheck", [PX P Flag Count],
-            "CashLeg_m", [PX P Cash Effect] / 1E6,
-            "StartedInWindow_m", [PX P Started] / 1E6,
-            "Title", [PX P Title], "Subtitle", [PX P Subtitle] ),
-        _ctx, _win, _from, _to )
-
-// ---- P2 top 15 ISINs by |effect|
-EVALUATE
-    VAR _t =
-        CALCULATETABLE (
-            FILTER (
-                SUMMARIZECOLUMNS ( FACT_ALLREPO[CodeIsinSJ], FACT_ALLREPO[IssuerName],
-                    "Face_m", [PX P Face],
-                    "PriceStart", [PX P Price Start], "PriceEnd", [PX P Price End], "Chg_pts", [PX P Price Chg],
-                    "Effect_m", [PX P Effect], "AbsEffect", [PX P Effect Abs],
-                    "BookedStart", [PX P Booked Start], "BookedEnd", [PX P Booked End],
-                    "GapStart_pts", [PX P Gap Start], "GapEnd_pts", [PX P Gap End],
-                    "OffMkt_m", [PX P Offmkt Effect], "Market_m", [PX P Market Effect], "Flag", [PX P Flag] ),
-                NOT ISBLANK ( [Effect_m] ) ),
-            _ctx, _win, _from, _to )
-    RETURN TOPN ( 15, _t, [AbsEffect], DESC )
-    ORDER BY [AbsEffect] DESC
-
-// ---- P3 daily prices of the 3 largest-effect ISINs (PX7)
-EVALUATE
-    VAR _top =
-        CALCULATETABLE (
-            TOPN ( 3,
-                FILTER ( ADDCOLUMNS ( VALUES ( FACT_ALLREPO[CodeIsinSJ] ), "@a", [PX P Effect Abs] ), NOT ISBLANK ( [@a] ) ),
-                [@a], DESC ),
-            _ctx, _win, _from, _to )
-    VAR _isin = SELECTCOLUMNS ( _top, "i", FACT_ALLREPO[CodeIsinSJ] )
-    RETURN
-        CALCULATETABLE (
-            FILTER (
-                SUMMARIZECOLUMNS ( FACT_ALLREPO[CodeIsinSJ], DIM_DATE[Date],
-                    TREATAS ( _isin, FACT_ALLREPO[CodeIsinSJ] ),
-                    DATESBETWEEN ( DIM_DATE[Date], DATE ( 2026, 11, 6 ), DATE ( 2026, 11, 11 ) ),
-                    "Price", [PX P Price T], "Move_pts", [PX P Move T] ),
-                NOT ISBLANK ( [Price] ) ),
-            _ctx, _win, _from, _to )
-    ORDER BY FACT_ALLREPO[CodeIsinSJ], DIM_DATE[Date]
-
-// ---- P4 ISINs held (start / end file), for timing context
-EVALUATE
-    CALCULATETABLE (
-        ROW (
-            "ISINs_start", VAR _r = [PX R0] RETURN CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO[CodeIsinSJ] ), REMOVEFILTERS ( DIM_DATE ),
-                FACT_ALLREPO[SnapshotDate] = _r, FACT_ALLREPO[SLA_CateCode] = "07L" ),
-            "ISINs_end", VAR _r = [PX R1] RETURN CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO[CodeIsinSJ] ), REMOVEFILTERS ( DIM_DATE ),
-                FACT_ALLREPO[SnapshotDate] = _r, FACT_ALLREPO[SLA_CateCode] = "07L" ),
-            "ISINs_all_dates", CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO[CodeIsinSJ] ), REMOVEFILTERS ( DIM_DATE ) ) ),
-        _ctx, _win, _from, _to )
-
-// ---- P5 diagnostic: price inputs per file, 3 largest ISINs, all clients
-EVALUATE
-    VAR _top =
-        CALCULATETABLE (
-            TOPN ( 3,
-                FILTER ( ADDCOLUMNS ( VALUES ( FACT_ALLREPO[CodeIsinSJ] ), "@a", [PX P Effect Abs] ), NOT ISBLANK ( [@a] ) ),
-                [@a], DESC ),
-            _ctx, _win, _from, _to )
-    VAR _files = CALCULATETABLE ( VALUES ( FACT_ALLREPO[SnapshotDate] ), REMOVEFILTERS (),
-        FACT_ALLREPO[SnapshotDate] >= DATE ( 2026, 11, 6 ), FACT_ALLREPO[SnapshotDate] <= DATE ( 2026, 11, 11 ) )
-    VAR _g = CROSSJOIN ( SELECTCOLUMNS ( _top, "ISIN", FACT_ALLREPO[CodeIsinSJ] ), _files )
-    RETURN
-        ADDCOLUMNS ( _g,
-            "Rows", VAR i = [ISIN] VAR d = FACT_ALLREPO[SnapshotDate] RETURN CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (),
-                FACT_ALLREPO[CodeIsinSJ] = i, FACT_ALLREPO[SnapshotDate] = d, FACT_ALLREPO[SLA_CateCode] = "07L" ),
-            "RowsNoBondMtM", VAR i = [ISIN] VAR d = FACT_ALLREPO[SnapshotDate] RETURN CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (),
-                FACT_ALLREPO[CodeIsinSJ] = i, FACT_ALLREPO[SnapshotDate] = d, FACT_ALLREPO[SLA_CateCode] = "07L",
-                FILTER ( ALL ( FACT_ALLREPO[MTMSecurity_EUR] ), FACT_ALLREPO[MTMSecurity_EUR] = 0 || ISBLANK ( FACT_ALLREPO[MTMSecurity_EUR] ) ) ) + 0,
-            "FaceAll_m", VAR i = [ISIN] VAR d = FACT_ALLREPO[SnapshotDate] RETURN CALCULATE ( SUMX ( FACT_ALLREPO, ABS ( FACT_ALLREPO[NotionalBond_EUR] ) ), REMOVEFILTERS (),
-                FACT_ALLREPO[CodeIsinSJ] = i, FACT_ALLREPO[SnapshotDate] = d, FACT_ALLREPO[SLA_CateCode] = "07L" ) / 1E6,
-            "FaceFwd_m", VAR i = [ISIN] VAR d = FACT_ALLREPO[SnapshotDate] RETURN CALCULATE ( SUMX ( FACT_ALLREPO, ABS ( FACT_ALLREPO[NotionalBond_EUR] ) ), REMOVEFILTERS (),
-                FACT_ALLREPO[CodeIsinSJ] = i, FACT_ALLREPO[SnapshotDate] = d, FACT_ALLREPO[SLA_CateCode] = "07L",
-                FILTER ( ALL ( FACT_ALLREPO[StartDate] ), FACT_ALLREPO[StartDate] > d ) ) / 1E6 + 0,
-            "PriceAllRows_18a", VAR i = [ISIN] VAR d = FACT_ALLREPO[SnapshotDate] RETURN CALCULATE (
-                DIVIDE ( SUMX ( FACT_ALLREPO, ABS ( FACT_ALLREPO[MTMSecurity_EUR] ) ), SUMX ( FACT_ALLREPO, ABS ( FACT_ALLREPO[NotionalBond_EUR] ) ) ) * 100,
-                REMOVEFILTERS (), FACT_ALLREPO[CodeIsinSJ] = i, FACT_ALLREPO[SnapshotDate] = d, FACT_ALLREPO[SLA_CateCode] = "07L" ),
-            "PriceWeighted_18b", VAR i = [ISIN] VAR d = FACT_ALLREPO[SnapshotDate] RETURN CALCULATE (
-                DIVIDE ( SUMX ( FILTER ( FACT_ALLREPO, FACT_ALLREPO[MTMSecurity_EUR] <> 0 && FACT_ALLREPO[NotionalBond_EUR] <> 0 ), ABS ( FACT_ALLREPO[MTMSecurity_EUR] ) ),
-                    SUMX ( FILTER ( FACT_ALLREPO, FACT_ALLREPO[MTMSecurity_EUR] <> 0 && FACT_ALLREPO[NotionalBond_EUR] <> 0 ), ABS ( FACT_ALLREPO[NotionalBond_EUR] ) ) ) * 100,
-                REMOVEFILTERS (), FACT_ALLREPO[CodeIsinSJ] = i, FACT_ALLREPO[SnapshotDate] = d, FACT_ALLREPO[SLA_CateCode] = "07L",
-                FILTER ( ALL ( FACT_ALLREPO[StartDate] ), FACT_ALLREPO[StartDate] <= d ) ),
-            "RowPriceMedian", VAR i = [ISIN] VAR d = FACT_ALLREPO[SnapshotDate] RETURN CALCULATE (
-                MEDIANX ( FILTER ( FACT_ALLREPO, FACT_ALLREPO[MTMSecurity_EUR] <> 0 && FACT_ALLREPO[NotionalBond_EUR] <> 0 ),
-                    ABS ( FACT_ALLREPO[MTMSecurity_EUR] / FACT_ALLREPO[NotionalBond_EUR] ) * 100 ),
-                REMOVEFILTERS (), FACT_ALLREPO[CodeIsinSJ] = i, FACT_ALLREPO[SnapshotDate] = d, FACT_ALLREPO[SLA_CateCode] = "07L",
-                FILTER ( ALL ( FACT_ALLREPO[StartDate] ), FACT_ALLREPO[StartDate] <= d ) ),
-            "RowPriceMin", VAR i = [ISIN] VAR d = FACT_ALLREPO[SnapshotDate] RETURN CALCULATE (
-                MINX ( FILTER ( FACT_ALLREPO, FACT_ALLREPO[MTMSecurity_EUR] <> 0 && FACT_ALLREPO[NotionalBond_EUR] <> 0 ),
-                    ABS ( FACT_ALLREPO[MTMSecurity_EUR] / FACT_ALLREPO[NotionalBond_EUR] ) * 100 ),
-                REMOVEFILTERS (), FACT_ALLREPO[CodeIsinSJ] = i, FACT_ALLREPO[SnapshotDate] = d, FACT_ALLREPO[SLA_CateCode] = "07L",
-                FILTER ( ALL ( FACT_ALLREPO[StartDate] ), FACT_ALLREPO[StartDate] <= d ) ),
-            "RowPriceMax", VAR i = [ISIN] VAR d = FACT_ALLREPO[SnapshotDate] RETURN CALCULATE (
-                MAXX ( FILTER ( FACT_ALLREPO, FACT_ALLREPO[MTMSecurity_EUR] <> 0 && FACT_ALLREPO[NotionalBond_EUR] <> 0 ),
-                    ABS ( FACT_ALLREPO[MTMSecurity_EUR] / FACT_ALLREPO[NotionalBond_EUR] ) * 100 ),
-                REMOVEFILTERS (), FACT_ALLREPO[CodeIsinSJ] = i, FACT_ALLREPO[SnapshotDate] = d, FACT_ALLREPO[SLA_CateCode] = "07L",
-                FILTER ( ALL ( FACT_ALLREPO[StartDate] ), FACT_ALLREPO[StartDate] <= d ) ) )
-    ORDER BY [ISIN], FACT_ALLREPO[SnapshotDate]
-
-// ---- P6 (18d) the client's rows behind the off-market part, 3 largest bonds by |off-market|
-EVALUATE
-    VAR _top =
-        CALCULATETABLE (
-            TOPN ( 3,
-                FILTER ( ADDCOLUMNS ( VALUES ( FACT_ALLREPO[CodeIsinSJ] ), "@o", ABS ( [PX P Offmkt Effect] ) ), NOT ISBLANK ( [@o] ) ),
-                [@o], DESC ),
-            _ctx, _win, _from, _to )
-    VAR _isin = SELECTCOLUMNS ( _top, "i", FACT_ALLREPO[CodeIsinSJ] )
-    VAR _rows =
-        CALCULATETABLE (
-            SUMMARIZE ( FACT_ALLREPO, FACT_ALLREPO[CodeIsinSJ], FACT_ALLREPO[SnapshotDate], FACT_ALLREPO[CCCTradeKey],
-                FACT_ALLREPO[BuySell], FACT_ALLREPO[StartDate] ),
-            REMOVEFILTERS ( DIM_DATE ), TREATAS ( _isin, FACT_ALLREPO[CodeIsinSJ] ),
-            FACT_ALLREPO[SnapshotDate] IN { DATE ( 2026, 11, 6 ), DATE ( 2026, 11, 11 ) }, FACT_ALLREPO[SLA_CateCode] = "07L",
-            _ctx )
-    RETURN
-        ADDCOLUMNS ( _rows,
-            "Face_m", CALCULATE ( SUM ( FACT_ALLREPO[NotionalBond_EUR] ) ) / 1E6,
-            "BondMtM_m", CALCULATE ( SUM ( FACT_ALLREPO[MTMSecurity_EUR] ) ) / 1E6,
-            "RowPrice", VAR f = CALCULATE ( SUM ( FACT_ALLREPO[NotionalBond_EUR] ) ) VAR m = CALCULATE ( SUM ( FACT_ALLREPO[MTMSecurity_EUR] ) )
-                RETURN IF ( f <> 0 && m <> 0, ABS ( m / f ) * 100 ),
-            "MarketPrice", VAR i = FACT_ALLREPO[CodeIsinSJ] VAR d = FACT_ALLREPO[SnapshotDate] RETURN CALCULATE (
-                MEDIANX ( FILTER ( FACT_ALLREPO, FACT_ALLREPO[MTMSecurity_EUR] <> 0 && FACT_ALLREPO[NotionalBond_EUR] <> 0 ),
-                    ABS ( FACT_ALLREPO[MTMSecurity_EUR] / FACT_ALLREPO[NotionalBond_EUR] ) ) * 100,
-                REMOVEFILTERS (), FACT_ALLREPO[CodeIsinSJ] = i, FACT_ALLREPO[SnapshotDate] = d, FACT_ALLREPO[SLA_CateCode] = "07L",
-                FILTER ( ALL ( FACT_ALLREPO[StartDate] ), FACT_ALLREPO[StartDate] <= d ) ),
-            "Started", FACT_ALLREPO[StartDate] <= FACT_ALLREPO[SnapshotDate] )
-    ORDER BY FACT_ALLREPO[CodeIsinSJ], FACT_ALLREPO[SnapshotDate], FACT_ALLREPO[CCCTradeKey]
-// Gap per row = RowPrice - MarketPrice (Excel). Off-market MtM per row = sign(BondMtM) x (|BondMtM| - MarketPrice/100 x |Face|),
-// + on B (repo) rows, - on S (reverse repo) rows. Rows with Started = FALSE are not in the effect (forward-starting).
-
-
-
-
-
-
-
+// ---- S1 threshold in price points: booked price vs market price (median of all clients' rows), or a booked jump the
+//      market price did not make.
 PX Price Threshold =
 DATATABLE (
     "Label", STRING, "Points", DOUBLE, "Order", INTEGER,
     { { "0.25 pt", 0.25, 1 }, { "0.5 pt", 0.5, 2 }, { "1 pt", 1, 3 }, { "2 pt", 2, 4 }, { "5 pt", 5, 5 } }
 )
+
+// ---- S2 (18f) side slicer for the bond-price visuals (PX6, PX7, PX TT Price). Sort Side by Order; hide Order.
+//      17A = repo (BuySell B, bonds we delivered) · 17B = reverse repo (BuySell S, bonds we hold as collateral).
+PX Side =
+DATATABLE ( "Side", STRING, "Order", INTEGER, { { "Both", 1 }, { "17A", 2 }, { "17B", 3 } } )
