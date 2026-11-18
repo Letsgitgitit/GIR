@@ -1,0 +1,16 @@
+PX bond prices — FAQ and column definitions (build 2026-11-18f)
+Basics
+Where the prices come from. ALLREPO only: each repo row carries the bond leg in EUR (MTMSecurity_EUR) and the
+bond face in EUR (NotionalBond_EUR). Price = |bond MtM| ÷ |face| × 100. No external price feed.
+Dirty price. Includes accrued coupon: on a coupon date the price drops by the coupon with no market move.
+FX. Both legs are converted to EUR at the same rate, so FX cancels in the price.
+Rounding (LITE model). Bond MtM and face are stored to EUR 1k per row: prices are exact to about 0.01 pt on large
+holdings; a small row can show steps that are rounding.
+Sign convention. Same as market risk: repo MtM negative = in our favour. "+" in an effect = moves MtM against us.
+Sides. 17A = repo (BuySell B): we delivered the bond, a price RISE is against us. 17B = reverse repo (BuySell S):
+we hold the bond as collateral, a price FALL is against us.
+Window. The PX window (1D / 1W / 2W / 1M / Custom). Start and end = the last ALLREPO file on or before each date.
+Which trades count. Repo rows (07L), Sponsored per the PX switch. Prices and effects use trades started on the
+file (forward-starting trades have no bond leg yet).
+Assumption. 16A runs on the bank's booked prices (to confirm with market risk), so a wrong booked price is shown
+as a possible cause of a 16A move, not cleaned away.
