@@ -1,0 +1,110 @@
+// =====================================================================================
+// ALLREPO_LITE_P6A_CHECK.dax  -  BUILD 2026-11-17c  -  read-only
+// P6a Hedge Fund Watch after the lite swap: the parts that read FACT_ALLREPO. Run the SAME file in both .pbix
+// (lite = reference, liter = core scope) and put the tabs side by side. Nothing picked in As of = latest file date
+// (13 Nov 2026 in both). Hedge funds are ordinary clients: every date is in core, so every tab must be identical,
+// apart from the last digits of EUR amounts (rounded to EUR 1,000 in both). Sales dates differ between the two .pbix,
+// so the X activity cards are left out (they read Sales).
+//   Q0  P6 measures in error (expect none, both)
+//   Q1  repo cards at the latest date: K4 repo net risk (17A / 17B), K4 detail, Sponsored, K6
+//   Q2  R1 collateral mix: face per row (As of ... 2Y ago) x rating bucket
+//   Q3  R texts: weighted haircut (R1c), top issuer share, 17B risk delta, subtitles
+//   Q4  R3 series, 12 NAV months (month-end files)
+//   Q5  raw control, HF scope, 07L, ex Sponsored: rows / trades / RiskNet / face per date, latest + 4 Nov 2026
+//       (4 Nov targets, preflight: K4 EUR 114.5m = 17A 39.1m + 17B 75.4m, face EUR 64.2bn, haircut 0.34 %)
+//   Q6  ALLREPO new trades by trade date, last 12 weeks, HF scope (activity source, ALLREPO side only)
+// If 'P1 Source' does not hold "Facts", change _kFacts (Q0 of P6A_MEASURES_CHECK lists the values).
+// =====================================================================================
+DEFINE
+    VAR _kFacts = "Facts"
+    VAR _kScope = TREATAS ( { "Hedge fund" }, DIM_COUNTERPARTY[HF Scope] )
+    VAR _kSrcF = TREATAS ( { _kFacts }, 'P1 Source'[Source] )
+    VAR _dr = CALCULATE ( MAX ( FACT_ALLREPO[SnapshotDate] ), REMOVEFILTERS () )
+    VAR _ids = CALCULATETABLE ( VALUES ( DIM_COUNTERPARTY[HeadOfficeSirisId] ), REMOVEFILTERS (), DIM_COUNTERPARTY[HF Scope] = "Hedge fund" )
+
+// ---- Q0 measures in error ----------------------------------------------------------------------------------------
+EVALUATE
+    SELECTCOLUMNS ( FILTER ( INFO.MEASURES (), LEFT ( [Name], 3 ) = "P6 " && [State] <> 1 ),
+        "Measure", [Name], "State", [State], "Error", [ErrorMessage] )
+
+// ---- Q1 repo cards (latest) ---------------------------------------------------------------------------------------
+EVALUATE
+    CALCULATETABLE (
+        ROW ( "AsOf", [P6 AsOf], "RepoNet", [P6 Repo Net Risk], "Repo17A", [P6 Repo Net Risk 17A],
+            "Repo17B", [P6 Repo Net Risk 17B], "K4", [P6 K4 Detail], "K4Spons", [P6 K4 Sponsored],
+            "K6", [P6 Repo Limit Util %], "K6Detail", [P6 K6 Detail] ),
+        _kScope, _kSrcF )
+
+// ---- Q2 R1 collateral mix ----------------------------------------------------------------------------------------
+EVALUATE
+    SUMMARIZECOLUMNS ( 'P6W R Row'[Row], 'P6W Rating Map'[Bucket], _kScope, "Face", [P6 R1 Collateral] )
+    ORDER BY 'P6W R Row'[Row], 'P6W Rating Map'[Bucket]
+
+// ---- Q3 R texts ----------------------------------------------------------------------------------------------------
+EVALUATE
+    CALCULATETABLE (
+        ROW ( "Haircut", [P6 R Wtd Haircut], "HaircutDelta", [P6 R Haircut Delta],
+            "TopIssuer", [P6 R Top Issuer Share], "TopIssuerDelta", [P6 R Top Issuer Delta],
+            "Risk17B", [P6 Repo Net Risk 17B], "Risk17BDelta", [P6 R 17B Risk Delta],
+            "R2Subtitle", [P6 R2 Subtitle], "R3Corr", [P6 R3 Corr], "RSubtitle", [P6 R Subtitle] ),
+        _kScope )
+
+// ---- Q4 R3 series --------------------------------------------------------------------------------------------------
+EVALUATE
+    FILTER (
+        SUMMARIZECOLUMNS ( DIM_DATE[YearMonth], _kScope,
+            "NAV1M", [P6 R3 NAV 1M], "LowGrade", [P6 R3 Low Grade Share], "R2Share_all", [P6 R LowGrade At] ),
+        NOT ISBLANK ( [NAV1M] ) || NOT ISBLANK ( [LowGrade] ) )
+    ORDER BY DIM_DATE[YearMonth]
+
+// ---- Q5 raw control (no P6 measure involved) -----------------------------------------------------------------------
+EVALUATE
+    ADDCOLUMNS (
+        CROSSJOIN ( DATATABLE ( "Date", DATETIME, { { "2026-11-04" } } ) , DATATABLE ( "BuySell", STRING, { { "B" }, { "S" } } ) ),
+        "Rows", VAR _d = [Date] VAR _b = [BuySell]
+            RETURN CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (), TREATAS ( _ids, FACT_ALLREPO[HeadOfficeSirisId] ),
+                FACT_ALLREPO[SnapshotDate] = _d, FACT_ALLREPO[SLA_CateCode] = "07L", FACT_ALLREPO[BuySell] = _b,
+                KEEPFILTERS ( FILTER ( ALL ( FACT_ALLREPO[InstLabel] ), NOT CONTAINSSTRING ( FACT_ALLREPO[InstLabel], "Sponsored" ) ) ) ),
+        "Trades", VAR _d = [Date] VAR _b = [BuySell]
+            RETURN CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO[CCCTradeKey] ), REMOVEFILTERS (), TREATAS ( _ids, FACT_ALLREPO[HeadOfficeSirisId] ),
+                FACT_ALLREPO[SnapshotDate] = _d, FACT_ALLREPO[SLA_CateCode] = "07L", FACT_ALLREPO[BuySell] = _b,
+                KEEPFILTERS ( FILTER ( ALL ( FACT_ALLREPO[InstLabel] ), NOT CONTAINSSTRING ( FACT_ALLREPO[InstLabel], "Sponsored" ) ) ) ),
+        "RiskNet_m", VAR _d = [Date] VAR _b = [BuySell]
+            RETURN CALCULATE ( SUM ( FACT_ALLREPO[RiskNet_EUR] ), REMOVEFILTERS (), TREATAS ( _ids, FACT_ALLREPO[HeadOfficeSirisId] ),
+                FACT_ALLREPO[SnapshotDate] = _d, FACT_ALLREPO[SLA_CateCode] = "07L", FACT_ALLREPO[BuySell] = _b,
+                KEEPFILTERS ( FILTER ( ALL ( FACT_ALLREPO[InstLabel] ), NOT CONTAINSSTRING ( FACT_ALLREPO[InstLabel], "Sponsored" ) ) ) ) / 1E6,
+        "Face_bn", VAR _d = [Date] VAR _b = [BuySell]
+            RETURN CALCULATE ( SUMX ( FACT_ALLREPO, ABS ( FACT_ALLREPO[NotionalBond_EUR] ) ), REMOVEFILTERS (), TREATAS ( _ids, FACT_ALLREPO[HeadOfficeSirisId] ),
+                FACT_ALLREPO[SnapshotDate] = _d, FACT_ALLREPO[SLA_CateCode] = "07L", FACT_ALLREPO[BuySell] = _b,
+                KEEPFILTERS ( FILTER ( ALL ( FACT_ALLREPO[InstLabel] ), NOT CONTAINSSTRING ( FACT_ALLREPO[InstLabel], "Sponsored" ) ) ) ) / 1E9 )
+EVALUATE
+    ADDCOLUMNS (
+        DATATABLE ( "BuySell", STRING, { { "B" }, { "S" } } ),
+        "LatestDate", _dr,
+        "Rows", VAR _b = [BuySell]
+            RETURN CALCULATE ( COUNTROWS ( FACT_ALLREPO ), REMOVEFILTERS (), TREATAS ( _ids, FACT_ALLREPO[HeadOfficeSirisId] ),
+                FACT_ALLREPO[SnapshotDate] = _dr, FACT_ALLREPO[SLA_CateCode] = "07L", FACT_ALLREPO[BuySell] = _b,
+                KEEPFILTERS ( FILTER ( ALL ( FACT_ALLREPO[InstLabel] ), NOT CONTAINSSTRING ( FACT_ALLREPO[InstLabel], "Sponsored" ) ) ) ),
+        "RiskNet_m", VAR _b = [BuySell]
+            RETURN CALCULATE ( SUM ( FACT_ALLREPO[RiskNet_EUR] ), REMOVEFILTERS (), TREATAS ( _ids, FACT_ALLREPO[HeadOfficeSirisId] ),
+                FACT_ALLREPO[SnapshotDate] = _dr, FACT_ALLREPO[SLA_CateCode] = "07L", FACT_ALLREPO[BuySell] = _b,
+                KEEPFILTERS ( FILTER ( ALL ( FACT_ALLREPO[InstLabel] ), NOT CONTAINSSTRING ( FACT_ALLREPO[InstLabel], "Sponsored" ) ) ) ) / 1E6,
+        "Face_bn", VAR _b = [BuySell]
+            RETURN CALCULATE ( SUMX ( FACT_ALLREPO, ABS ( FACT_ALLREPO[NotionalBond_EUR] ) ), REMOVEFILTERS (), TREATAS ( _ids, FACT_ALLREPO[HeadOfficeSirisId] ),
+                FACT_ALLREPO[SnapshotDate] = _dr, FACT_ALLREPO[SLA_CateCode] = "07L", FACT_ALLREPO[BuySell] = _b,
+                KEEPFILTERS ( FILTER ( ALL ( FACT_ALLREPO[InstLabel] ), NOT CONTAINSSTRING ( FACT_ALLREPO[InstLabel], "Sponsored" ) ) ) ) / 1E9 )
+
+// ---- Q6 ALLREPO new trades by trade date, 12 weeks ending on the latest file --------------------------------------
+EVALUATE
+    ADDCOLUMNS ( ADDCOLUMNS ( GENERATESERIES ( 0, 11, 1 ), "@end", _dr - 7 * [Value] ),
+        "S_trades", VAR _we = [@end] VAR _ws = _we - 7 VAR _sx = _we + 5
+            RETURN CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO[CCCTradeKey] ), REMOVEFILTERS (), TREATAS ( _ids, FACT_ALLREPO[HeadOfficeSirisId] ),
+                FACT_ALLREPO[SLA_CateCode] = "07L", FACT_ALLREPO[BuySell] = "S", FACT_ALLREPO[TradeDate] > _ws, FACT_ALLREPO[TradeDate] <= _we,
+                FACT_ALLREPO[SnapshotDate] > _ws, FACT_ALLREPO[SnapshotDate] <= _sx,
+                KEEPFILTERS ( FILTER ( ALL ( FACT_ALLREPO[InstLabel] ), NOT CONTAINSSTRING ( FACT_ALLREPO[InstLabel], "Sponsored" ) ) ) ),
+        "B_trades", VAR _we = [@end] VAR _ws = _we - 7 VAR _sx = _we + 5
+            RETURN CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO[CCCTradeKey] ), REMOVEFILTERS (), TREATAS ( _ids, FACT_ALLREPO[HeadOfficeSirisId] ),
+                FACT_ALLREPO[SLA_CateCode] = "07L", FACT_ALLREPO[BuySell] = "B", FACT_ALLREPO[TradeDate] > _ws, FACT_ALLREPO[TradeDate] <= _we,
+                FACT_ALLREPO[SnapshotDate] > _ws, FACT_ALLREPO[SnapshotDate] <= _sx,
+                KEEPFILTERS ( FILTER ( ALL ( FACT_ALLREPO[InstLabel] ), NOT CONTAINSSTRING ( FACT_ALLREPO[InstLabel], "Sponsored" ) ) ) ) )
+    ORDER BY [Value]
