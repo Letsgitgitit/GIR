@@ -1,0 +1,37 @@
+// =====================================================================================
+// PX_MTM_CHECK.dax  -  BUILD 2026-11-14b  -  read-only. Why does our repo MtM differ from the market-risk note?
+// PX_DATE_CHECK (14 Nov) ruled out a simple date offset: the 11 Nov note (4.9 / 10.6bn) matches our 11 AND 12 Nov files,
+// the 4 Nov note (4.9 / 10.4bn) matches our 6 Nov file, and the MtM (-119 / -65) matches no file.
+// This splits each file by side (B = repo, S = reverse repo) so the MtM can be rebuilt several ways:
+//   ours      = (Sec - MtMCash)_B - (Sec - MtMCash)_S
+//   no accrual = (Sec - CashAmt)_B - (Sec - CashAmt)_S          (repo interest left out)
+//   haircut   = ours -/+ SecxHaircut                              (collateral value after haircut)
+// and tests the notional: traded by the date but not yet started, and starting within 3 days (T+2 settlement).
+// Set _ids (same Ricos). One row per file x side, 3 -> 12 Nov. Flag the grid back.
+// =====================================================================================
+DEFINE
+    VAR _ids = { "0000000000" }                 // <- the fund's Ricos
+    VAR _notSp = FILTER ( ALL ( FACT_ALLREPO[InstLabel] ), NOT CONTAINSSTRING ( FACT_ALLREPO[InstLabel], "Sponsored" ) )
+EVALUATE
+    VAR _files = CALCULATETABLE ( VALUES ( FACT_ALLREPO[SnapshotDate] ), REMOVEFILTERS (),
+        FACT_ALLREPO[SnapshotDate] >= DATE ( 2026, 11, 3 ), FACT_ALLREPO[SnapshotDate] <= DATE ( 2026, 11, 12 ) )
+    VAR _grid = CROSSJOIN ( _files, DATATABLE ( "Side", STRING, { { "B" }, { "S" } } ) )
+    RETURN
+        ADDCOLUMNS ( _grid,
+            "Sec_m", VAR d = FACT_ALLREPO[SnapshotDate] VAR s = [Side] RETURN
+                CALCULATE ( SUM ( FACT_ALLREPO[MTMSecurity_EUR] ), REMOVEFILTERS (), TREATAS ( _ids, FACT_ALLREPO[HeadOfficeSirisId] ), FACT_ALLREPO[SnapshotDate] = d, FACT_ALLREPO[SLA_CateCode] = "07L", FACT_ALLREPO[BuySell] = s, _notSp, FILTER ( ALL ( FACT_ALLREPO[StartDate] ), FACT_ALLREPO[StartDate] <= d ) ) / 1E6,
+            "MtMCash_m", VAR d = FACT_ALLREPO[SnapshotDate] VAR s = [Side] RETURN
+                CALCULATE ( SUM ( FACT_ALLREPO[MTMCash_EUR] ), REMOVEFILTERS (), TREATAS ( _ids, FACT_ALLREPO[HeadOfficeSirisId] ), FACT_ALLREPO[SnapshotDate] = d, FACT_ALLREPO[SLA_CateCode] = "07L", FACT_ALLREPO[BuySell] = s, _notSp, FILTER ( ALL ( FACT_ALLREPO[StartDate] ), FACT_ALLREPO[StartDate] <= d ) ) / 1E6,
+            "CashAmt_m", VAR d = FACT_ALLREPO[SnapshotDate] VAR s = [Side] RETURN
+                CALCULATE ( SUM ( FACT_ALLREPO[CashAmount_EUR] ), REMOVEFILTERS (), TREATAS ( _ids, FACT_ALLREPO[HeadOfficeSirisId] ), FACT_ALLREPO[SnapshotDate] = d, FACT_ALLREPO[SLA_CateCode] = "07L", FACT_ALLREPO[BuySell] = s, _notSp, FILTER ( ALL ( FACT_ALLREPO[StartDate] ), FACT_ALLREPO[StartDate] <= d ) ) / 1E6,
+            "Face_m", VAR d = FACT_ALLREPO[SnapshotDate] VAR s = [Side] RETURN
+                CALCULATE ( SUM ( FACT_ALLREPO[NotionalBond_EUR] ), REMOVEFILTERS (), TREATAS ( _ids, FACT_ALLREPO[HeadOfficeSirisId] ), FACT_ALLREPO[SnapshotDate] = d, FACT_ALLREPO[SLA_CateCode] = "07L", FACT_ALLREPO[BuySell] = s, _notSp, FILTER ( ALL ( FACT_ALLREPO[StartDate] ), FACT_ALLREPO[StartDate] <= d ) ) / 1E6,
+            "SecxHaircut_m", VAR d = FACT_ALLREPO[SnapshotDate] VAR s = [Side] RETURN
+                CALCULATE ( SUMX ( FACT_ALLREPO, FACT_ALLREPO[MTMSecurity_EUR] * FACT_ALLREPO[Haircut] ), REMOVEFILTERS (), TREATAS ( _ids, FACT_ALLREPO[HeadOfficeSirisId] ), FACT_ALLREPO[SnapshotDate] = d, FACT_ALLREPO[SLA_CateCode] = "07L", FACT_ALLREPO[BuySell] = s, _notSp, FILTER ( ALL ( FACT_ALLREPO[StartDate] ), FACT_ALLREPO[StartDate] <= d ) ) / 1E6,
+            "Trades_n", VAR d = FACT_ALLREPO[SnapshotDate] VAR s = [Side] RETURN
+                CALCULATE ( DISTINCTCOUNT ( FACT_ALLREPO[CCCTradeKey] ), REMOVEFILTERS (), TREATAS ( _ids, FACT_ALLREPO[HeadOfficeSirisId] ), FACT_ALLREPO[SnapshotDate] = d, FACT_ALLREPO[SLA_CateCode] = "07L", FACT_ALLREPO[BuySell] = s, _notSp, FILTER ( ALL ( FACT_ALLREPO[StartDate] ), FACT_ALLREPO[StartDate] <= d ) ) / 1,
+            "TradedNotStarted_bn", VAR d = FACT_ALLREPO[SnapshotDate] VAR s = [Side] RETURN
+                CALCULATE ( SUM ( FACT_ALLREPO[CashAmount_EUR] ), REMOVEFILTERS (), TREATAS ( _ids, FACT_ALLREPO[HeadOfficeSirisId] ), FACT_ALLREPO[SnapshotDate] = d, FACT_ALLREPO[SLA_CateCode] = "07L", FACT_ALLREPO[BuySell] = s, _notSp, FILTER ( ALL ( FACT_ALLREPO[TradeDate] ), FACT_ALLREPO[TradeDate] <= d ), FILTER ( ALL ( FACT_ALLREPO[StartDate] ), FACT_ALLREPO[StartDate] > d ) ) / 1E9,
+            "StartsNext3d_bn", VAR d = FACT_ALLREPO[SnapshotDate] VAR s = [Side] RETURN
+                CALCULATE ( SUM ( FACT_ALLREPO[CashAmount_EUR] ), REMOVEFILTERS (), TREATAS ( _ids, FACT_ALLREPO[HeadOfficeSirisId] ), FACT_ALLREPO[SnapshotDate] = d, FACT_ALLREPO[SLA_CateCode] = "07L", FACT_ALLREPO[BuySell] = s, _notSp, FILTER ( ALL ( FACT_ALLREPO[StartDate] ), FACT_ALLREPO[StartDate] > d && FACT_ALLREPO[StartDate] <= d + 3 ) ) / 1E9 )
+    ORDER BY FACT_ALLREPO[SnapshotDate], [Side]
