@@ -1,0 +1,57 @@
+let
+  Path = "C:\Data\clients.txt",
+  Lines = List.Skip(
+    Lines.FromBinary(File.Contents(Path), null, null, 65001), 1),
+  T = Table.FromColumns({Lines}, {"Line"}),
+  Flag = Table.AddColumn(
+    T, "Blank", each Text.Trim([Line]) = "", type logical),
+  Grp = Table.Group(
+    Flag, {"Blank"}, {{"L", each [Line], type list}},
+    GroupKind.Local),
+  Recs = Table.SelectRows(Grp, each [Blank] = false),
+
+  Toks = (s as text) as list =>
+    List.Select(
+      List.Transform(Text.Split(s, "#(tab)"), Text.Trim),
+      each _ <> ""),
+
+  // "UNITED STATES United States" -> "UNITED STATES"
+  Ctry = (s as text) as text =>
+    let
+      w = List.Select(Text.Split(Text.Trim(s), " "), each _ <> ""),
+      c = List.Count(w)
+    in
+      if Number.IsEven(c) and c > 0
+      then Text.Combine(List.FirstN(w, c / 2), " ")
+      else Text.Trim(s),
+
+  Parse = (L as list) as record =>
+    let
+      n = List.Count(L),
+      a = Toks(L{0}),
+      full = n >= 4,
+      b = if full then Toks(L{2}) else List.Skip(a, 2),
+      raw = a{0},
+      tip = "This Operational Client contains"
+    in
+      [
+        OperationalClient = if Text.Contains(raw, tip)
+                            then Text.BeforeDelimiter(raw, tip) else raw,
+        HasCarveOut = Text.Contains(raw, "CarveOut"),
+        Nature = a{1}?,
+        OpCountry = if full then Ctry(L{1}) else null,
+        IntRating = b{0}?,
+        CommercialClient = b{1}?,
+        CommCountry = Ctry(List.Last(L)),
+        LineCount = n
+      ],
+
+  Out = Table.FromRecords(List.Transform(Recs[L], Parse))
+in
+  Out
+
+
+
+
+
+
