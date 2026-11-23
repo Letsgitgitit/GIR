@@ -54,4 +54,178 @@ in
 
 
 
+DEFINE
+    // ---- tree entities (LOC rows = the sponsor's own local lines, skipped) -------------------
+    VAR _tree =
+        DISTINCT(
+            SELECTCOLUMNS(
+                FILTER( SPONSOR_TREE, SPONSOR_TREE[Nature] <> "LOC" ),
+                "TreeName", TRIM( SPONSOR_TREE[OperationalClient] ),
+                "Nature", SPONSOR_TREE[Nature],
+                "OpCountry", SPONSOR_TREE[OpCountry],
+                "Commercial", SPONSOR_TREE[CommercialClient]
+            )
+        )
+    VAR _treeK =
+        ADDCOLUMNS(
+            _tree,
+            "RKey",
+                SUBSTITUTE( SUBSTITUTE( SUBSTITUTE( SUBSTITUTE( SUBSTITUTE( SUBSTITUTE(
+                    UPPER( [TreeName] ) & " ", " LIMITED ", " LTD " ),
+                    ".", "" ), ",", "" ), "'", "" ), "-", "" ), " ", "" )
+        )
+    // ---- WAR DB entities ------------------------------------------------------------------------
+    VAR _dim =
+        ADDCOLUMNS(
+            SELECTCOLUMNS(
+                FILTER( ALL( DIM_COUNTERPARTY ), LEN( DIM_COUNTERPARTY[Name] ) > 0 ),
+                "Id", DIM_COUNTERPARTY[HeadOfficeSirisId],
+                "DimName", DIM_COUNTERPARTY[Name],
+                "CPH_Id", DIM_COUNTERPARTY[CPH_Id],
+                "CPH_Name", DIM_COUNTERPARTY[CPH_Name],
+                "InCORTEX", DIM_COUNTERPARTY[InCORTEX]
+            ),
+            "Key",
+                SUBSTITUTE( SUBSTITUTE( SUBSTITUTE( SUBSTITUTE( SUBSTITUTE( SUBSTITUTE(
+                    UPPER( TRIM( [DimName] ) ) & " ", " LIMITED ", " LTD " ),
+                    ".", "" ), ",", "" ), "'", "" ), "-", "" ), " ", "" )
+        )
+    // ---- candidates + activity per candidate ------------------------------------------------------
+    VAR _cand =
+        GENERATEALL(
+            _treeK,
+            VAR k = [RKey]
+            VAR p20 = LEFT( k, 20 )
+            VAR p15 = LEFT( k, 15 )
+            VAR exact = FILTER( _dim, [Key] = k )
+            VAR nE = COUNTROWS( exact )
+            VAR pref = FILTER( _dim, nE = 0 && LEFT( [Key], 20 ) = p20 )
+            VAR nP = COUNTROWS( pref )
+            VAR cont = FILTER( _dim, nE = 0 && nP = 0 && LEN( k ) >= 6 && CONTAINSSTRING( [Key], p15 ) )
+            VAR allC =
+                UNION(
+                    ADDCOLUMNS( exact, "Match", "1 exact" ),
+                    ADDCOLUMNS( pref, "Match", "2 prefix20" ),
+                    ADDCOLUMNS( cont, "Match", "3 contains15" )
+                )
+            RETURN
+                ADDCOLUMNS(
+                    TOPN( 5, allC, [InCORTEX], DESC, [Id], ASC ),
+                    "Candidates", COUNTROWS( allC ),
+                    "Deals",
+                        VAR id = [Id]
+                        RETURN CALCULATE( COUNTROWS( FACT_SALES ), DIM_COUNTERPARTY[HeadOfficeSirisId] = id ),
+                    "Deals2026",
+                        VAR id = [Id]
+                        RETURN CALCULATE( COUNTROWS( FACT_SALES ), DIM_COUNTERPARTY[HeadOfficeSirisId] = id,
+                                          FACT_SALES[DealDate] >= DATE( 2026, 1, 1 ) ),
+                    "LastDeal",
+                        VAR id = [Id]
+                        RETURN CALCULATE( MAX( FACT_SALES[DealDate] ), DIM_COUNTERPARTY[HeadOfficeSirisId] = id ),
+                    "Last16A",
+                        VAR id = [Id]
+                        RETURN CALCULATE( MAX( FACT_LIMIT_16A[SnapshotDate] ), DIM_COUNTERPARTY[HeadOfficeSirisId] = id,
+                                          FACT_LIMIT_16A[Utilisation] > 0 ),
+                    "Last06",
+                        VAR id = [Id]
+                        RETURN CALCULATE( MAX( FACT_LIMIT_06[SnapshotDate] ), DIM_COUNTERPARTY[HeadOfficeSirisId] = id,
+                                          FACT_LIMIT_06[Utilisation] > 0 ),
+                    "LastRepo",   // [may error]
+                        VAR id = [Id]
+                        RETURN CALCULATE( MAX( FACT_ALLREPO[SnapshotDate] ), DIM_COUNTERPARTY[HeadOfficeSirisId] = id )
+                )
+        )
+
+// ---- T1 candidates with activity --------------------------------------------------------------
+EVALUATE
+    SELECTCOLUMNS(
+        _cand,
+        "TreeName", [TreeName],
+        "Nature", [Nature],
+        "OpCountry", [OpCountry],
+        "Match", [Match],
+        "Candidates", [Candidates],
+        "RICOS", [Id],
+        "DimName", [DimName],
+        "CPH_Id", [CPH_Id],
+        "CPH_Name", [CPH_Name],
+        "InCORTEX", [InCORTEX],
+        "Deals", [Deals],
+        "Deals2026", [Deals2026],
+        "LastDeal", [LastDeal],
+        "Last16A", [Last16A],
+        "Last06", [Last06],
+        "LastRepo", [LastRepo]
+    )
+    ORDER BY [TreeName], [Nature], [Match], [InCORTEX] DESC
+
+// ---- T2 one row per tree entity -------------------------------------------------------------
+EVALUATE
+    ADDCOLUMNS(
+        SELECTCOLUMNS( _treeK, "TreeName", [TreeName], "Nature", [Nature], "Commercial", [Commercial] ),
+        "BestMatch",
+            VAR n = [TreeName] VAR t = [Nature]
+            RETURN MINX( FILTER( _cand, [TreeName] = n && [Nature] = t ), [Match] ),
+        "Candidates",
+            VAR n = [TreeName] VAR t = [Nature]
+            RETURN MAXX( FILTER( _cand, [TreeName] = n && [Nature] = t ), [Candidates] ),
+        "AnyDeals",
+            VAR n = [TreeName] VAR t = [Nature]
+            RETURN SUMX( FILTER( _cand, [TreeName] = n && [Nature] = t ), [Deals] ),
+        "LastDeal",
+            VAR n = [TreeName] VAR t = [Nature]
+            RETURN MAXX( FILTER( _cand, [TreeName] = n && [Nature] = t ), [LastDeal] ),
+        "Last16A",
+            VAR n = [TreeName] VAR t = [Nature]
+            RETURN MAXX( FILTER( _cand, [TreeName] = n && [Nature] = t ), [Last16A] ),
+        "Last06",
+            VAR n = [TreeName] VAR t = [Nature]
+            RETURN MAXX( FILTER( _cand, [TreeName] = n && [Nature] = t ), [Last06] )
+    )
+    ORDER BY [BestMatch] DESC, [TreeName]
+
+// ---- T3 tree CPH -> WAR DB CPH, activity of the whole CPH ----------------------------------------
+EVALUATE
+    VAR _cphDim =
+        ADDCOLUMNS(
+            FILTER(
+                DISTINCT( SELECTCOLUMNS( _dim, "CPH_Id", [CPH_Id], "CPH_Name", [CPH_Name] ) ),
+                LEN( [CPH_Id] ) > 0
+            ),
+            "CKey",
+                SUBSTITUTE( SUBSTITUTE( SUBSTITUTE( SUBSTITUTE( SUBSTITUTE( SUBSTITUTE(
+                    UPPER( TRIM( [CPH_Name] ) ) & " ", " LIMITED ", " LTD " ),
+                    ".", "" ), ",", "" ), "'", "" ), "-", "" ), " ", "" )
+        )
+    RETURN
+        GENERATEALL(
+            SELECTCOLUMNS( FILTER( _treeK, [Nature] = "CPH" ), "TreeCPH", [TreeName], "RKey", [RKey] ),
+            VAR k = [RKey]
+            RETURN
+                ADDCOLUMNS(
+                    SELECTCOLUMNS( FILTER( _cphDim, [CKey] = k ), "WarCPH_Id", [CPH_Id], "WarCPH_Name", [CPH_Name] ),
+                    "CPYs",
+                        VAR c = [WarCPH_Id]
+                        RETURN CALCULATE( COUNTROWS( DIM_COUNTERPARTY ), DIM_COUNTERPARTY[CPH_Id] = c ),
+                    "Deals",
+                        VAR c = [WarCPH_Id]
+                        RETURN CALCULATE( COUNTROWS( FACT_SALES ), DIM_COUNTERPARTY[CPH_Id] = c ),
+                    "Deals2026",
+                        VAR c = [WarCPH_Id]
+                        RETURN CALCULATE( COUNTROWS( FACT_SALES ), DIM_COUNTERPARTY[CPH_Id] = c,
+                                          FACT_SALES[DealDate] >= DATE( 2026, 1, 1 ) ),
+                    "LastDeal",
+                        VAR c = [WarCPH_Id]
+                        RETURN CALCULATE( MAX( FACT_SALES[DealDate] ), DIM_COUNTERPARTY[CPH_Id] = c ),
+                    "Last16A",
+                        VAR c = [WarCPH_Id]
+                        RETURN CALCULATE( MAX( FACT_LIMIT_16A[SnapshotDate] ), DIM_COUNTERPARTY[CPH_Id] = c,
+                                          FACT_LIMIT_16A[Utilisation] > 0 ),
+                    "Last06",
+                        VAR c = [WarCPH_Id]
+                        RETURN CALCULATE( MAX( FACT_LIMIT_06[SnapshotDate] ), DIM_COUNTERPARTY[CPH_Id] = c,
+                                          FACT_LIMIT_06[Utilisation] > 0 )
+                )
+        )
+    ORDER BY [Deals] DESC, [TreeCPH]
 
