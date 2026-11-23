@@ -1,3 +1,4 @@
+
 DEFINE
     // ---- tree entities (LOC rows = the sponsor's own local lines, skipped) -------------------
     VAR _tree =
@@ -181,36 +182,62 @@ EVALUATE
         )
     ORDER BY [Deals] DESC, [TreeCPH]
 
-// ---- T4 WAR DB CPHs reached by an exact entity match (the sponsor footprint) ----------------------
+// ---- T4 WAR DB groups reached by an EXACT entity match (the sponsor footprint) ----------------------
 EVALUATE
-    VAR _hits = FILTER( _cand, [Match] = "1 exact" && LEN( [CPH_Id] ) > 0 )
-    VAR _cphs = DISTINCT( SELECTCOLUMNS( _hits, "WarCPH_Id", [CPH_Id], "WarCPH_Name", [CPH_Name] ) )
+    VAR _hits =
+        ADDCOLUMNS(
+            FILTER( _cand, [Match] = "1 exact" ),
+            "GroupType", IF( LEN( [CPH_Id] ) > 0, "CPH", "CPY" ),
+            "GroupId", IF( LEN( [CPH_Id] ) > 0, [CPH_Id], [Id] ),
+            "GroupName", IF( LEN( [CPH_Id] ) > 0, [CPH_Name], [DimName] )
+        )
+    VAR _grp = DISTINCT( SELECTCOLUMNS( _hits, "GroupType", [GroupType], "GroupId", [GroupId], "GroupName", [GroupName] ) )
     RETURN
         ADDCOLUMNS(
-            _cphs,
+            _grp,
             "TreeEntitiesMatched",
-                VAR _c = [WarCPH_Id]
-                RETURN COUNTROWS( DISTINCT( SELECTCOLUMNS( FILTER( _hits, [CPH_Id] = _c ), "n", [TreeName] ) ) ),
+                VAR _g = [GroupId]
+                RETURN COUNTROWS( DISTINCT( SELECTCOLUMNS( FILTER( _hits, [GroupId] = _g ), "n", [TreeName] ) ) ),
             "CPYsInWarDB",
-                VAR _c = [WarCPH_Id]
-                RETURN CALCULATE( COUNTROWS( DIM_COUNTERPARTY ), DIM_COUNTERPARTY[CPH_Id] = _c ),
+                VAR _g = [GroupId] VAR _ty = [GroupType]
+                RETURN CALCULATE( COUNTROWS( DIM_COUNTERPARTY ),
+                    FILTER( ALL( DIM_COUNTERPARTY[CPH_Id], DIM_COUNTERPARTY[HeadOfficeSirisId] ),
+                        IF( _ty = "CPH", DIM_COUNTERPARTY[CPH_Id] = _g, DIM_COUNTERPARTY[HeadOfficeSirisId] = _g ) ) ),
             "Deals",
-                VAR _c = [WarCPH_Id]
-                RETURN CALCULATE( COUNTROWS( FACT_SALES ), DIM_COUNTERPARTY[CPH_Id] = _c ),
+                VAR _g = [GroupId] VAR _ty = [GroupType]
+                RETURN CALCULATE( COUNTROWS( FACT_SALES ),
+                    FILTER( ALL( DIM_COUNTERPARTY[CPH_Id], DIM_COUNTERPARTY[HeadOfficeSirisId] ),
+                        IF( _ty = "CPH", DIM_COUNTERPARTY[CPH_Id] = _g, DIM_COUNTERPARTY[HeadOfficeSirisId] = _g ) ) ),
             "Deals2026",
-                VAR _c = [WarCPH_Id]
-                RETURN CALCULATE( COUNTROWS( FACT_SALES ), DIM_COUNTERPARTY[CPH_Id] = _c,
-                                  FACT_SALES[DealDate] >= DATE( 2026, 1, 1 ) ),
+                VAR _g = [GroupId] VAR _ty = [GroupType]
+                RETURN CALCULATE( COUNTROWS( FACT_SALES ), FACT_SALES[DealDate] >= DATE( 2026, 1, 1 ),
+                    FILTER( ALL( DIM_COUNTERPARTY[CPH_Id], DIM_COUNTERPARTY[HeadOfficeSirisId] ),
+                        IF( _ty = "CPH", DIM_COUNTERPARTY[CPH_Id] = _g, DIM_COUNTERPARTY[HeadOfficeSirisId] = _g ) ) ),
+            "Revenue",            // [may error]
+                VAR _g = [GroupId] VAR _ty = [GroupType]
+                RETURN CALCULATE( [P5 Revenue],
+                    FILTER( ALL( DIM_COUNTERPARTY[CPH_Id], DIM_COUNTERPARTY[HeadOfficeSirisId] ),
+                        IF( _ty = "CPH", DIM_COUNTERPARTY[CPH_Id] = _g, DIM_COUNTERPARTY[HeadOfficeSirisId] = _g ) ) ),
+            "Revenue2026",        // [may error]
+                VAR _g = [GroupId] VAR _ty = [GroupType]
+                RETURN CALCULATE( [P5 Revenue], FACT_SALES[DealDate] >= DATE( 2026, 1, 1 ),
+                    FILTER( ALL( DIM_COUNTERPARTY[CPH_Id], DIM_COUNTERPARTY[HeadOfficeSirisId] ),
+                        IF( _ty = "CPH", DIM_COUNTERPARTY[CPH_Id] = _g, DIM_COUNTERPARTY[HeadOfficeSirisId] = _g ) ) ),
             "LastDeal",
-                VAR _c = [WarCPH_Id]
-                RETURN CALCULATE( MAX( FACT_SALES[DealDate] ), DIM_COUNTERPARTY[CPH_Id] = _c ),
+                VAR _g = [GroupId] VAR _ty = [GroupType]
+                RETURN CALCULATE( MAX( FACT_SALES[DealDate] ),
+                    FILTER( ALL( DIM_COUNTERPARTY[CPH_Id], DIM_COUNTERPARTY[HeadOfficeSirisId] ),
+                        IF( _ty = "CPH", DIM_COUNTERPARTY[CPH_Id] = _g, DIM_COUNTERPARTY[HeadOfficeSirisId] = _g ) ) ),
             "Last16A",
-                VAR _c = [WarCPH_Id]
-                RETURN CALCULATE( MAX( FACT_LIMIT_16A[SnapshotDate] ), DIM_COUNTERPARTY[CPH_Id] = _c,
-                                  FACT_LIMIT_16A[Utilisation] > 0 ),
+                VAR _g = [GroupId] VAR _ty = [GroupType]
+                RETURN CALCULATE( MAX( FACT_LIMIT_16A[SnapshotDate] ), FACT_LIMIT_16A[Utilisation] > 0,
+                    FILTER( ALL( DIM_COUNTERPARTY[CPH_Id], DIM_COUNTERPARTY[HeadOfficeSirisId] ),
+                        IF( _ty = "CPH", DIM_COUNTERPARTY[CPH_Id] = _g, DIM_COUNTERPARTY[HeadOfficeSirisId] = _g ) ) ),
             "Last06",
-                VAR _c = [WarCPH_Id]
-                RETURN CALCULATE( MAX( FACT_LIMIT_06[SnapshotDate] ), DIM_COUNTERPARTY[CPH_Id] = _c,
-                                  FACT_LIMIT_06[Utilisation] > 0 )
+                VAR _g = [GroupId] VAR _ty = [GroupType]
+                RETURN CALCULATE( MAX( FACT_LIMIT_06[SnapshotDate] ), FACT_LIMIT_06[Utilisation] > 0,
+                    FILTER( ALL( DIM_COUNTERPARTY[CPH_Id], DIM_COUNTERPARTY[HeadOfficeSirisId] ),
+                        IF( _ty = "CPH", DIM_COUNTERPARTY[CPH_Id] = _g, DIM_COUNTERPARTY[HeadOfficeSirisId] = _g ) ) ),
+            "Scope (fill in)", ""
         )
-    ORDER BY [Deals] DESC, [WarCPH_Name]
+    ORDER BY [Deals] DESC, [GroupName]
