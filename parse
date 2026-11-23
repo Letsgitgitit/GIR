@@ -113,26 +113,26 @@ DEFINE
                     TOPN( 5, allC, [InCORTEX], DESC, [Id], ASC ),
                     "Candidates", COUNTROWS( allC ),
                     "Deals",
-                        VAR id = [Id]
-                        RETURN CALCULATE( COUNTROWS( FACT_SALES ), DIM_COUNTERPARTY[HeadOfficeSirisId] = id ),
+                        VAR _rid = [Id]
+                        RETURN CALCULATE( COUNTROWS( FACT_SALES ), DIM_COUNTERPARTY[HeadOfficeSirisId] = _rid ),
                     "Deals2026",
-                        VAR id = [Id]
-                        RETURN CALCULATE( COUNTROWS( FACT_SALES ), DIM_COUNTERPARTY[HeadOfficeSirisId] = id,
+                        VAR _rid = [Id]
+                        RETURN CALCULATE( COUNTROWS( FACT_SALES ), DIM_COUNTERPARTY[HeadOfficeSirisId] = _rid,
                                           FACT_SALES[DealDate] >= DATE( 2026, 1, 1 ) ),
                     "LastDeal",
-                        VAR id = [Id]
-                        RETURN CALCULATE( MAX( FACT_SALES[DealDate] ), DIM_COUNTERPARTY[HeadOfficeSirisId] = id ),
+                        VAR _rid = [Id]
+                        RETURN CALCULATE( MAX( FACT_SALES[DealDate] ), DIM_COUNTERPARTY[HeadOfficeSirisId] = _rid ),
                     "Last16A",
-                        VAR id = [Id]
-                        RETURN CALCULATE( MAX( FACT_LIMIT_16A[SnapshotDate] ), DIM_COUNTERPARTY[HeadOfficeSirisId] = id,
+                        VAR _rid = [Id]
+                        RETURN CALCULATE( MAX( FACT_LIMIT_16A[SnapshotDate] ), DIM_COUNTERPARTY[HeadOfficeSirisId] = _rid,
                                           FACT_LIMIT_16A[Utilisation] > 0 ),
                     "Last06",
-                        VAR id = [Id]
-                        RETURN CALCULATE( MAX( FACT_LIMIT_06[SnapshotDate] ), DIM_COUNTERPARTY[HeadOfficeSirisId] = id,
+                        VAR _rid = [Id]
+                        RETURN CALCULATE( MAX( FACT_LIMIT_06[SnapshotDate] ), DIM_COUNTERPARTY[HeadOfficeSirisId] = _rid,
                                           FACT_LIMIT_06[Utilisation] > 0 ),
                     "LastRepo",   // [may error]
-                        VAR id = [Id]
-                        RETURN CALCULATE( MAX( FACT_ALLREPO[SnapshotDate] ), DIM_COUNTERPARTY[HeadOfficeSirisId] = id )
+                        VAR _rid = [Id]
+                        RETURN CALCULATE( MAX( FACT_ALLREPO[SnapshotDate] ), DIM_COUNTERPARTY[HeadOfficeSirisId] = _rid )
                 )
         )
 
@@ -205,27 +205,28 @@ EVALUATE
                 ADDCOLUMNS(
                     SELECTCOLUMNS( FILTER( _cphDim, [CKey] = k ), "WarCPH_Id", [CPH_Id], "WarCPH_Name", [CPH_Name] ),
                     "CPYs",
-                        VAR c = [WarCPH_Id]
-                        RETURN CALCULATE( COUNTROWS( DIM_COUNTERPARTY ), DIM_COUNTERPARTY[CPH_Id] = c ),
+                        VAR _cph = [WarCPH_Id]
+                        RETURN CALCULATE( COUNTROWS( DIM_COUNTERPARTY ), DIM_COUNTERPARTY[CPH_Id] = _cph ),
                     "Deals",
-                        VAR c = [WarCPH_Id]
-                        RETURN CALCULATE( COUNTROWS( FACT_SALES ), DIM_COUNTERPARTY[CPH_Id] = c ),
+                        VAR _cph = [WarCPH_Id]
+                        RETURN CALCULATE( COUNTROWS( FACT_SALES ), DIM_COUNTERPARTY[CPH_Id] = _cph ),
                     "Deals2026",
-                        VAR c = [WarCPH_Id]
-                        RETURN CALCULATE( COUNTROWS( FACT_SALES ), DIM_COUNTERPARTY[CPH_Id] = c,
+                        VAR _cph = [WarCPH_Id]
+                        RETURN CALCULATE( COUNTROWS( FACT_SALES ), DIM_COUNTERPARTY[CPH_Id] = _cph,
                                           FACT_SALES[DealDate] >= DATE( 2026, 1, 1 ) ),
                     "LastDeal",
-                        VAR c = [WarCPH_Id]
-                        RETURN CALCULATE( MAX( FACT_SALES[DealDate] ), DIM_COUNTERPARTY[CPH_Id] = c ),
+                        VAR _cph = [WarCPH_Id]
+                        RETURN CALCULATE( MAX( FACT_SALES[DealDate] ), DIM_COUNTERPARTY[CPH_Id] = _cph ),
                     "Last16A",
-                        VAR c = [WarCPH_Id]
-                        RETURN CALCULATE( MAX( FACT_LIMIT_16A[SnapshotDate] ), DIM_COUNTERPARTY[CPH_Id] = c,
+                        VAR _cph = [WarCPH_Id]
+                        RETURN CALCULATE( MAX( FACT_LIMIT_16A[SnapshotDate] ), DIM_COUNTERPARTY[CPH_Id] = _cph,
                                           FACT_LIMIT_16A[Utilisation] > 0 ),
                     "Last06",
-                        VAR c = [WarCPH_Id]
-                        RETURN CALCULATE( MAX( FACT_LIMIT_06[SnapshotDate] ), DIM_COUNTERPARTY[CPH_Id] = c,
+                        VAR _cph = [WarCPH_Id]
+                        RETURN CALCULATE( MAX( FACT_LIMIT_06[SnapshotDate] ), DIM_COUNTERPARTY[CPH_Id] = _cph,
                                           FACT_LIMIT_06[Utilisation] > 0 )
                 )
         )
     ORDER BY [Deals] DESC, [TreeCPH]
+]
 
