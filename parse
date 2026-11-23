@@ -1,59 +1,3 @@
-let
-  Path = "C:\Data\clients.txt",
-  Lines = List.Skip(
-    Lines.FromBinary(File.Contents(Path), null, null, 65001), 1),
-  T = Table.FromColumns({Lines}, {"Line"}),
-  Flag = Table.AddColumn(
-    T, "Blank", each Text.Trim([Line]) = "", type logical),
-  Grp = Table.Group(
-    Flag, {"Blank"}, {{"L", each [Line], type list}},
-    GroupKind.Local),
-  Recs = Table.SelectRows(Grp, each [Blank] = false),
-
-  Toks = (s as text) as list =>
-    List.Select(
-      List.Transform(Text.Split(s, "#(tab)"), Text.Trim),
-      each _ <> ""),
-
-  // "UNITED STATES United States" -> "UNITED STATES"
-  Ctry = (s as text) as text =>
-    let
-      w = List.Select(Text.Split(Text.Trim(s), " "), each _ <> ""),
-      c = List.Count(w)
-    in
-      if Number.IsEven(c) and c > 0
-      then Text.Combine(List.FirstN(w, c / 2), " ")
-      else Text.Trim(s),
-
-  Parse = (L as list) as record =>
-    let
-      n = List.Count(L),
-      a = Toks(L{0}),
-      full = n >= 4,
-      b = if full then Toks(L{2}) else List.Skip(a, 2),
-      raw = a{0},
-      tip = "This Operational Client contains"
-    in
-      [
-        OperationalClient = if Text.Contains(raw, tip)
-                            then Text.BeforeDelimiter(raw, tip) else raw,
-        HasCarveOut = Text.Contains(raw, "CarveOut"),
-        Nature = a{1}?,
-        OpCountry = if full then Ctry(L{1}) else null,
-        IntRating = b{0}?,
-        CommercialClient = b{1}?,
-        CommCountry = Ctry(List.Last(L)),
-        LineCount = n
-      ],
-
-  Out = Table.FromRecords(List.Transform(Recs[L], Parse))
-in
-  Out
-
-
-
-
-
 DEFINE
     // ---- tree entities (LOC rows = the sponsor's own local lines, skipped) -------------------
     VAR _tree =
@@ -99,9 +43,9 @@ DEFINE
             VAR p15 = LEFT( k, 15 )
             VAR exact = FILTER( _dim, [Key] = k )
             VAR nE = COUNTROWS( exact )
-            VAR pref = FILTER( _dim, nE = 0 && LEFT( [Key], 20 ) = p20 )
+            VAR pref = FILTER( _dim, nE = 0 && LEN( k ) >= 20 && LEFT( [Key], 20 ) = p20 )
             VAR nP = COUNTROWS( pref )
-            VAR cont = FILTER( _dim, nE = 0 && nP = 0 && LEN( k ) >= 6 && CONTAINSSTRING( [Key], p15 ) )
+            VAR cont = FILTER( _dim, nE = 0 && nP = 0 && LEN( k ) >= 15 && CONTAINSSTRING( [Key], p15 ) )
             VAR allC =
                 UNION(
                     ADDCOLUMNS( exact, "Match", "1 exact" ),
@@ -159,30 +103,35 @@ EVALUATE
     )
     ORDER BY [TreeName], [Nature], [Match], [InCORTEX] DESC
 
-// ---- T2 one row per tree entity -------------------------------------------------------------
+// ---- T2 one row per tree entity (totals over the best-tier candidates only) ------------------
 EVALUATE
     ADDCOLUMNS(
-        SELECTCOLUMNS( _treeK, "TreeName", [TreeName], "Nature", [Nature], "Commercial", [Commercial] ),
-        "BestMatch",
-            VAR n = [TreeName] VAR t = [Nature]
-            RETURN MINX( FILTER( _cand, [TreeName] = n && [Nature] = t ), [Match] ),
+        ADDCOLUMNS(
+            SELECTCOLUMNS( _treeK, "TreeName", [TreeName], "Nature", [Nature], "Commercial", [Commercial] ),
+            "BestMatch",
+                VAR _n = [TreeName] VAR _t = [Nature]
+                RETURN MINX( FILTER( _cand, [TreeName] = _n && [Nature] = _t ), [Match] )
+        ),
         "Candidates",
-            VAR n = [TreeName] VAR t = [Nature]
-            RETURN MAXX( FILTER( _cand, [TreeName] = n && [Nature] = t ), [Candidates] ),
-        "AnyDeals",
-            VAR n = [TreeName] VAR t = [Nature]
-            RETURN SUMX( FILTER( _cand, [TreeName] = n && [Nature] = t ), [Deals] ),
+            VAR _n = [TreeName] VAR _t = [Nature]
+            RETURN MAXX( FILTER( _cand, [TreeName] = _n && [Nature] = _t ), [Candidates] ),
+        "RICOS",
+            VAR _n = [TreeName] VAR _t = [Nature] VAR _b = [BestMatch]
+            RETURN CONCATENATEX( FILTER( _cand, [TreeName] = _n && [Nature] = _t && [Match] = _b ), [Id], " | " ),
+        "Deals",
+            VAR _n = [TreeName] VAR _t = [Nature] VAR _b = [BestMatch]
+            RETURN SUMX( FILTER( _cand, [TreeName] = _n && [Nature] = _t && [Match] = _b ), [Deals] ),
         "LastDeal",
-            VAR n = [TreeName] VAR t = [Nature]
-            RETURN MAXX( FILTER( _cand, [TreeName] = n && [Nature] = t ), [LastDeal] ),
+            VAR _n = [TreeName] VAR _t = [Nature] VAR _b = [BestMatch]
+            RETURN MAXX( FILTER( _cand, [TreeName] = _n && [Nature] = _t && [Match] = _b ), [LastDeal] ),
         "Last16A",
-            VAR n = [TreeName] VAR t = [Nature]
-            RETURN MAXX( FILTER( _cand, [TreeName] = n && [Nature] = t ), [Last16A] ),
+            VAR _n = [TreeName] VAR _t = [Nature] VAR _b = [BestMatch]
+            RETURN MAXX( FILTER( _cand, [TreeName] = _n && [Nature] = _t && [Match] = _b ), [Last16A] ),
         "Last06",
-            VAR n = [TreeName] VAR t = [Nature]
-            RETURN MAXX( FILTER( _cand, [TreeName] = n && [Nature] = t ), [Last06] )
+            VAR _n = [TreeName] VAR _t = [Nature] VAR _b = [BestMatch]
+            RETURN MAXX( FILTER( _cand, [TreeName] = _n && [Nature] = _t && [Match] = _b ), [Last06] )
     )
-    ORDER BY [BestMatch] DESC, [TreeName]
+    ORDER BY [BestMatch], [Deals] DESC, [TreeName]
 
 // ---- T3 tree CPH -> WAR DB CPH, activity of the whole CPH ----------------------------------------
 EVALUATE
@@ -193,14 +142,17 @@ EVALUATE
                 LEN( [CPH_Id] ) > 0
             ),
             "CKey",
-                SUBSTITUTE( SUBSTITUTE( SUBSTITUTE( SUBSTITUTE( SUBSTITUTE( SUBSTITUTE(
-                    UPPER( TRIM( [CPH_Name] ) ) & " ", " LIMITED ", " LTD " ),
-                    ".", "" ), ",", "" ), "'", "" ), "-", "" ), " ", "" )
+                VAR ck =
+                    SUBSTITUTE( SUBSTITUTE( SUBSTITUTE( SUBSTITUTE( SUBSTITUTE( SUBSTITUTE(
+                        UPPER( TRIM( [CPH_Name] ) ) & " ", " LIMITED ", " LTD " ),
+                        ".", "" ), ",", "" ), "'", "" ), "-", "" ), " ", "" )
+                RETURN IF( RIGHT( ck, 3 ) = "CPH" && LEN( ck ) > 3, LEFT( ck, LEN( ck ) - 3 ), ck )
         )
     RETURN
         GENERATEALL(
             SELECTCOLUMNS( FILTER( _treeK, [Nature] = "CPH" ), "TreeCPH", [TreeName], "RKey", [RKey] ),
-            VAR k = [RKey]
+            VAR k0 = [RKey]
+            VAR k = IF( RIGHT( k0, 3 ) = "CPH" && LEN( k0 ) > 3, LEFT( k0, LEN( k0 ) - 3 ), k0 )
             RETURN
                 ADDCOLUMNS(
                     SELECTCOLUMNS( FILTER( _cphDim, [CKey] = k ), "WarCPH_Id", [CPH_Id], "WarCPH_Name", [CPH_Name] ),
@@ -228,5 +180,37 @@ EVALUATE
                 )
         )
     ORDER BY [Deals] DESC, [TreeCPH]
-]
 
+// ---- T4 WAR DB CPHs reached by an exact entity match (the sponsor footprint) ----------------------
+EVALUATE
+    VAR _hits = FILTER( _cand, [Match] = "1 exact" && LEN( [CPH_Id] ) > 0 )
+    VAR _cphs = DISTINCT( SELECTCOLUMNS( _hits, "WarCPH_Id", [CPH_Id], "WarCPH_Name", [CPH_Name] ) )
+    RETURN
+        ADDCOLUMNS(
+            _cphs,
+            "TreeEntitiesMatched",
+                VAR _c = [WarCPH_Id]
+                RETURN COUNTROWS( DISTINCT( SELECTCOLUMNS( FILTER( _hits, [CPH_Id] = _c ), "n", [TreeName] ) ) ),
+            "CPYsInWarDB",
+                VAR _c = [WarCPH_Id]
+                RETURN CALCULATE( COUNTROWS( DIM_COUNTERPARTY ), DIM_COUNTERPARTY[CPH_Id] = _c ),
+            "Deals",
+                VAR _c = [WarCPH_Id]
+                RETURN CALCULATE( COUNTROWS( FACT_SALES ), DIM_COUNTERPARTY[CPH_Id] = _c ),
+            "Deals2026",
+                VAR _c = [WarCPH_Id]
+                RETURN CALCULATE( COUNTROWS( FACT_SALES ), DIM_COUNTERPARTY[CPH_Id] = _c,
+                                  FACT_SALES[DealDate] >= DATE( 2026, 1, 1 ) ),
+            "LastDeal",
+                VAR _c = [WarCPH_Id]
+                RETURN CALCULATE( MAX( FACT_SALES[DealDate] ), DIM_COUNTERPARTY[CPH_Id] = _c ),
+            "Last16A",
+                VAR _c = [WarCPH_Id]
+                RETURN CALCULATE( MAX( FACT_LIMIT_16A[SnapshotDate] ), DIM_COUNTERPARTY[CPH_Id] = _c,
+                                  FACT_LIMIT_16A[Utilisation] > 0 ),
+            "Last06",
+                VAR _c = [WarCPH_Id]
+                RETURN CALCULATE( MAX( FACT_LIMIT_06[SnapshotDate] ), DIM_COUNTERPARTY[CPH_Id] = _c,
+                                  FACT_LIMIT_06[Utilisation] > 0 )
+        )
+    ORDER BY [Deals] DESC, [WarCPH_Name]
