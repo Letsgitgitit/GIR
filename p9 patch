@@ -1,0 +1,22 @@
+// =====================================================================================
+// P6W_SETUP_PATCH_09.dax  -  BUILD 2026-11-24b  -  P6a: Movers CPY switch + haircut tooltip sparkline axis
+// S1 BEFORE P6A_MEASURES_TE2.csx build 2026-11-24b (the script stops if 'P6W HC Month' is missing).
+// S2 AFTER the csx (it needs the measure P6 M Blank).
+// =====================================================================================
+
+// ---- S1 sparkline axis for the haircut tooltip: 12 steps, 1 = 11 months before the as-of month ... 12 = as-of month.
+//      Modeling ▸ New table ▸ paste ▸ Enter. No relationship. Hide Label if you like (Step is the axis).
+P6W HC Month =
+SELECTCOLUMNS ( GENERATESERIES ( 1, 12, 1 ), "Step", [Value], "Label", "m-" & ( 12 - [Value] ) )
+
+// ---- S2 Movers detail switch = a FIELD PARAMETER (Modeling ▸ New parameter ▸ Fields). Do NOT paste with New table.
+// Name: P6W M Detail. Add, in this order: _Measures ▸ P6 M Blank, then DIM_COUNTERPARTY ▸ CPY Label. Untick "Add slicer".
+// In the formula bar change only the two labels to CPH / CPY, so it reads:
+//
+// P6W M Detail = {
+//     ( "CPH", NAMEOF ( '_Measures'[P6 M Blank] ), 0 ),
+//     ( "CPY", NAMEOF ( 'DIM_COUNTERPARTY'[CPY Label] ), 1 )
+// }
+//
+// "CPH" = the Movers table as today (the blank measure adds an empty, zero-width column); "CPY" = the CPYs of each CPH
+// listed under it. Nothing else changes.
